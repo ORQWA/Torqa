@@ -62,6 +62,57 @@ See the [boulder gallery](../art/README.md#vegetation).
 
 ## Standard route views
 
+### Andermatt sidewalks
+
+Generators 27–33 give sidewalk copies one owner using the local mapped section matched to
+the ride. Coarse GPX bends no longer leave duplicate footways or phantom clearance cuts;
+independent nearby streets and unridden parallel arms of the same map feature remain.
+Walking tops follow their owning street's height and grade instead of draping down a bank
+cut by another road. Closed sides reach terrain, and entrances and furniture share the
+walking profile.
+Road-width changes taper continuously. Partial building overlaps remove only the occupied
+area, and rounding a bend no longer uses a replacement area large enough to cut the
+sidewalk of the neighbouring street.
+Curved joins share the adjoining straight walking surfaces' grades across the whole width;
+matching footprints no longer conceal a height step at the tangent cross-section.
+Overlapping walking pieces share one surface and grade. Continuous mapped streets keep
+their own bend geometry rather than receiving another junction fan inside their loops;
+narrow service arms cannot create isolated corner tiles without walking approaches.
+Side walls close only the exposed walking perimeter; internal clipping seams no longer
+extrude through the tread. Repeated boolean-cut vertices cannot duplicate paving.
+Inferred raised sidewalks now require at least 12 m of connected walking length after
+clipping. Short corner remnants disappear; small construction sections that join into a
+long walk qualify together, including around bends and across terrain chunks.
+
+These matching overview cameras use the full saved Alpenbrevet Gold inputs at
+209.36 km to go (about 1.38 km from the start), near Andermatt. Nearby geometry alone is
+sent to the renderer; the complete route determines terrain shaping and projection.
+Buildings use their generated shells for context; vegetation is omitted.
+Generic regression fixtures vary road width, loop direction and terrain-chunk placement;
+they check coverage, walking height on both sides of internal joins and exposed side walls.
+The fixed village, lakeside junction, city-bench and Oberalp hairpin/tunnel views below were
+also regenerated and reviewed with the correction.
+The village, junction, city-bench and Oberalp hairpin views were refreshed again for the
+minimum-length rule; the long city walk and its bench/bin placement remain intact.
+
+| Before | Continuous sidewalk at street height |
+|---|---|
+| ![Sidewalk strips draped down the Andermatt road bank](images/issues/andermatt-sidewalk-before.jpg) | ![Continuous walking surface follows the elevated street](images/issues/andermatt-sidewalk-after.jpg) |
+| ![Fragmented walking edge down the bank](images/issues/andermatt-sidewalk-edge-before.jpg) | ![Level walking edge with its closed side reaching terrain](images/issues/andermatt-sidewalk-edge-after.jpg) |
+| ![Step where the straight walking strip meets its curve](images/issues/andermatt-sidewalk-step-before.jpg) | ![Continuous grade across the straight and curved walking surfaces](images/issues/andermatt-sidewalk-step-after.jpg) |
+| ![Stacked paving and internal channels in a turning island](images/issues/andermatt-sidewalk-island-before.jpg) | ![Joined turning-island paving without internal channels](images/issues/andermatt-sidewalk-island-after.jpg) |
+
+![Junction and adjoining sidewalks after the continuity corrections](images/issues/andermatt-sidewalk-junction-after.jpg)
+
+The following matching cameras use the same complete saved course at **116.93 km to go**
+(93.81 km from the start). The short raised stubs beside the street are removed, while the
+long sidewalk and separate building-front paving remain. Buildings use generated shells;
+vegetation is omitted as in the Andermatt views above.
+
+| Short sidewalk fragments | Minimum connected walking length |
+|---|---|
+| ![Short raised sidewalk stubs along a village street](images/issues/sidewalk-minimum-before.jpg) | ![Short stubs omitted and the continuous village sidewalk retained](images/issues/sidewalk-minimum-after.jpg) |
+
 ### Bridge ownership
 
 The Alpenbrevet Lukmanier approach (approximately 34.8 km into the saved course) exposed a

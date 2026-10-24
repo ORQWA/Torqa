@@ -775,7 +775,7 @@ fn bench_spots(station: &Station, side: f64, roadside: &Roadside) -> Option<Seat
         ..*station
     };
     let mut bin = room(&bin_station, side, BENCH_OFFSET, 0.3, roadside)?;
-    let lift_at = |point| roadside.urban.sidewalk_lift(point);
+    let lift_at = |point| roadside.urban.sidewalk_lift(point, roadside.heights);
     let (mut low, mut high) = (f64::MAX, f64::MIN);
     let owner = (
         (seat[0] / crate::CHUNK_SIZE).floor() * crate::CHUNK_SIZE,

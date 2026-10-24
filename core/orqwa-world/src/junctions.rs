@@ -47,10 +47,13 @@ pub(crate) struct Corner {
     centre: (f64, f64),
     radius: f64,
     end_lifts: [f64; 2],
+    footway_bases: [((f64, f64), bool); 2],
 }
 
 /// A sidewalk following the same curved edge as its junction's carriageway.
 pub(crate) struct FootwayCorner {
+    /// Street-centre anchors at the tangent cross-sections; true for the ridden road.
+    pub bases: [((f64, f64), bool); 2],
     /// Region replaced by the curved sidewalk, between its tangent cross-sections.
     pub zone: Vec<(f64, f64)>,
     /// Convex pieces, with street heights at their two cross-sections.
@@ -63,6 +66,8 @@ pub(crate) struct FootwaySection {
     pub polygon: Vec<(f64, f64)>,
     /// Street heights at the first and second cross-sections.
     pub lifts: [f64; 2],
+    /// Fractions along the complete corner's shared height profile.
+    pub span: [f64; 2],
 }
 
 impl Corner {
@@ -84,11 +89,11 @@ impl Corner {
             )
         };
         #[allow(clippy::cast_precision_loss)] // a few arc sections
-        let lift = |i: usize| {
-            self.end_lifts[0]
-                + (self.end_lifts[1] - self.end_lifts[0]) * i as f64 / (self.arc.len() - 1) as f64
-        };
+        let fraction = |i: usize| i as f64 / (self.arc.len() - 1) as f64;
+        let lift =
+            |i: usize| self.end_lifts[0] + (self.end_lifts[1] - self.end_lifts[0]) * fraction(i);
         Some(FootwayCorner {
+            bases: self.footway_bases,
             zone: vec![
                 self.apex,
                 self.arc[0],
@@ -107,6 +112,7 @@ impl Corner {
                         offset(pair[0], inset + width),
                     ],
                     lifts: [lift(i), lift(i + 1)],
+                    span: [fraction(i), fraction(i + 1)],
                 })
                 .collect(),
         })
@@ -285,6 +291,11 @@ fn fillets(arms: &[Arm], off: &Off) -> Vec<Corner> {
     let mut corners = Vec::new();
     for (k, a) in sorted.iter().enumerate() {
         let b = sorted[(k + 1) % sorted.len()];
+        // A continuous mapped street already draws its bends. Treating its two arms
+        // as a new junction cuts a second corner through the island inside a loop.
+        if a.street.is_some() && a.street == b.street {
+            continue;
+        }
         let angle = (heading(b.direction) - heading(a.direction)).rem_euclid(std::f64::consts::TAU);
         if !(CORNER.0..=CORNER.1).contains(&angle) {
             continue;
@@ -374,6 +385,16 @@ fn fillet(a: &Arm, b: &Arm, angle: f64) -> Option<Corner> {
         centre,
         radius,
         end_lifts: [a.lift, b.lift],
+        footway_bases: [
+            (
+                (start.0 - left.0 * a.half, start.1 - left.1 * a.half),
+                a.street.is_none(),
+            ),
+            (
+                (end.0 - right.0 * b.half, end.1 - right.1 * b.half),
+                b.street.is_none(),
+            ),
+        ],
     })
 }
 
@@ -554,4 +575,39 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 #[allow(clippy::cast_possible_truncation)] // local metres stay far below 2^63 cells
 fn cell(p: (f64, f64), size: f64) -> (i64, i64) {
     ((p.0 / size).floor() as i64, (p.1 / size).floor() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuous_street_arms_do_not_add_a_second_corner_through_their_bend() {
+        let a = Arm {
+            from: (0.0, 0.0),
+            direction: (1.0, 0.0),
+            half: 3.0,
+            reach: 100.0,
+            lift: 0.07,
+            paved: true,
+            street: Some(0),
+        };
+        let mut b = Arm {
+            direction: (0.0, 1.0),
+            ..a
+        };
+        let off = |arm: &Arm, p: (f64, f64)| {
+            ((p.0 - arm.from.0) * arm.direction.1 - (p.1 - arm.from.1) * arm.direction.0).abs()
+        };
+        assert!(
+            fillets(&[a, b], &off).is_empty(),
+            "a continuous street already has its bend geometry"
+        );
+        b.street = Some(1);
+        assert_eq!(
+            fillets(&[a, b], &off).len(),
+            1,
+            "independent joining streets retain their rounded corner"
+        );
+    }
 }

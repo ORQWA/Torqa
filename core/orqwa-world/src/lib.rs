@@ -52,7 +52,7 @@ pub use vegetation::Trees;
 /// differently: a world kept with an older one is still ridden, and its course offers to build
 /// it again (R101). A change that also makes kept worlds unreadable raises
 /// [`stored::FORMAT`] instead or as well.
-pub const GENERATOR: u32 = 27;
+pub const GENERATOR: u32 = 33;
 
 /// Edge length of a terrain chunk.
 pub(crate) const CHUNK_SIZE: f64 = 480.0;
@@ -293,15 +293,25 @@ pub async fn generate<M: ElevationModel>(
         hills: true,
     };
     let below = structures::Below::new(&road, &ways.network.index, &ways.streets, &ways.islands);
-    let urban = urban::Urban::build(
+    let mut world = whole(&shapers, &ways);
+    let ridden_pavement = pavement::Pavement::new(&world, []);
+    let mut urban = urban::Urban::build(
         buildings.values().flatten(),
         &ways.streets,
         &ways.corners,
         &ways.clearance,
         &road,
         &land,
+        ridden_pavement,
     );
-    let mut world = whole(&shapers, &ways);
+    // Walking joins need one datum even when their profile anchors lie in another chunk.
+    let mut grades = Vec::new();
+    for point in urban.grade_points() {
+        if let Some(height) = drawn_ground(model, &projection, &shapers, point).await {
+            grades.push((point, height));
+        }
+    }
+    urban.pin_grades(grades);
     let mut chunk_barriers = Vec::new();
     let mouths = streets::mouths(&ways.streets, &road);
     let places: Vec<(String, (f64, f64))> = map

@@ -65,6 +65,51 @@ bends and clips footway polygons against the road instead of discarding complete
 The road-facing border uses separate 18 cm curbstones with a 2 cm beveled lip and 75 cm joints.
 Bench and vegetation queries use the same clipped footprints as the rendered meshes.
 
+Generator 27 keeps the matched original map feature alongside each ridden road segment's
+appearance, plus its projected position on the matched local map section. Copies of that
+section share one sidewalk and pavement owner, so coarse GPX bends and chained tile pieces
+cannot create a second footway that cuts gaps in the ridden strip. Superseded map clearance
+does not cut the new walk. Independent streets, joining arms and unridden parallel arms of
+the same map feature keep their walks. This matching data is temporary; stored format 3
+is unchanged.
+Its walking tops follow the owning street profile, rather than a nearby lower road's bank.
+Ridden endpoints use road elevations, mapped walks use centre-line terrain samples, and
+junction curves use their inner edge. Both sides share the same grade and cross-section
+datum; access ramps and bench/bin height queries agree with that surface. Solid sides
+extend down to terrain, with buried edges kept correctly wound. Stored format remains 3.
+Generator 28 carries both endpoint widths through walking strips, joins and access offsets.
+Actual ridden carriageway triangles replace the wider terrain-shaping envelope in sidewalk
+clearance, avoiding false gaps where road width changes. Partial overlaps with drawn building
+outlines are clipped, preserving the clear walking width and closing the new outer edges.
+Submillimetre GPU clipping slivers are discarded before normals are computed. Footprints
+and height queries remain shared with vegetation and furniture; stored format stays 3.
+Generator 29 limits a rounded bend's replacement triangle to the original outer sidewalk
+miter, plus a 2 cm allowance. Its previous three-radius reach could cut a nearby parallel
+street's walk while the curved replacement stayed beside its own road. The full saved
+Andermatt comparison includes both streets; stored format remains 3.
+Generator 30 shares the straight walking surfaces' grade fields with curved joins, across
+the full tangent cross-section. Each arc section blends the same two parents using its
+fraction along the whole corner; street-centre anchors supply fallback profiles. Review
+the joints from road height too: matching footprints can still conceal a vertical step.
+Generator 31 clips overlapping walking footprints to one top and fits a common grade through
+each connected overlap region, easing into adjoining profiles over one walking width.
+Folded inner offsets become bounded footprints before road clipping. Profiles at overlaps
+and chunk boundaries share globally sampled endpoint heights instead of extrapolating a
+different grade from each chunk.
+Corner pieces require walking approaches at both ends; a paved junction alone cannot add
+isolated sidewalk tiles beside a service road. Junction fans are reserved for distinct
+street arms; a continuous street already owns its bend geometry, including inside a loop.
+Walking overlap components are determined before ownership trimming and include touching
+overlap groups, so clipping cannot split their grade. Stored format remains 3.
+Generator 32 clips side extrusions to the exposed walking perimeter and ignores repeated
+mask vertices, preventing internal side walls and duplicate boolean pieces. Stored format
+remains 3.
+Generator 33 requires at least 12 m of connected inferred raised sidewalk after clipping
+and overlap ownership, before chunking. Surviving longitudinal intervals accumulate across
+straight and curved pieces, with clipping partitions counted once. Isolated remnants do
+not inherit missing source length. Access paths and forecourts retain their own rules;
+stored format remains 3.
+
 River surfaces (R118, [ADR 0030](adr/0030-river-levels.md)) use generator 8 with the same
 stored format 2. `water_levels.rs` samples waterway centre lines before chunk generation;
 both water meshes and channel beds use those shared elevations. Keep these profiles

@@ -94,6 +94,36 @@ gallery. Grain alone is insufficient at distance. Refresh the linked wiki images
 
 ## Pitfalls
 
+For sidewalks, use the full saved Alpenbrevet Gold inputs at 209.36 km to go (about 1.38 km
+from the start) in Andermatt. Inspect the elevated bend and the nearby village junction in
+one overview, then move closer to the walking edge. Offset GPX/map copies must not make
+duplicate strips or trim each other into pieces. Retain independent streets' walks, include
+tile-piece and terrain-chunk joins, and check curbs and lowered access from road height.
+Include a rounded bend beside a separate street: its corner replacement must not cut the
+neighbour's sidewalk, including when the two streets have different heights.
+Inspect the full width of tangent joins at street height on sloping ground. Straight and
+curved strips must share a grade, including lowered access; intact footprints from above
+do not prove that the walking surface is continuous.
+Include a small turning island on sloping ground and an urban junction with a narrow
+service arm. Walking surfaces must not stack inside the island, and corners must not
+leave isolated tiles where no eligible sidewalk approaches exist.
+Inferred raised sidewalk runs need 12 m of surviving connected length. Check small corner
+remnants and the Alpenbrevet village at 116.93 km to go alongside long village strips.
+Short construction sections and curves must qualify together across chunk boundaries;
+clipped-away street length, width partitions and point contacts cannot qualify a fragment.
+Use an elongated island for overlap/grade checks; a short isolated island is omitted.
+Check the entire island perimeter at close range: a surviving raised rim with a channel
+inside it is still incorrect. Junction construction wedges must not excavate an existing
+walking run; rounded carriageway fans must remain clear of paving.
+Inspect internal clipping seams from road height too. Shared footway pieces must not
+extrude side walls through their joined tread; retain closed sides only on the exposed
+perimeter. If a dark triangle remains, inspect its mesh and repeat without shadows before
+attributing it to lighting.
+Include widening and narrowing streets and a wall touching only the outer part of a walk.
+The usable strip must remain continuous and keep clear of the actual asphalt, while clipped
+outer faces reach terrain. Inspect the same sloping, partially clipped corner for reversed
+faces or seams; the wider terrain-shaping envelope is not the walking boundary.
+
 For roadside guardrail placement, include a tight hairpin from above with both edges visible.
 Four-metre models placed on centre-line tangents can overlap inside a curve and leave gaps
 outside it. Check shared blade endpoints, vertical alignment across terrain chunk boundaries,

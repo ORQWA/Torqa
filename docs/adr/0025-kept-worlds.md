@@ -221,3 +221,44 @@ Generator 27 matches routes to roundabouts the way traffic goes round them (R126
 planner's file that skips the ring no longer takes the short way against the traffic. The
 ridden road of a kept world follows the old route there; regeneration redraws it. Stored
 format remains 3.
+
+The sidewalk correction also retains temporary map feature IDs and projected local map
+positions to give
+offset GPX/map copies of a street one sidewalk and pavement owner. Mapped street chains
+retain their constituent IDs. This prevents
+duplicate footways from cutting gaps in the ridden sidewalk or remaining on the bank.
+Independent streets, joining arms and unridden parallel arms of the same mapped road remain;
+superseded map clearance no longer cuts the new walk. Stored format stays 3.
+Its sidewalk tops also follow owning street profiles rather than the cut bank. Ridden
+elevations are retained temporarily, mapped profiles sample their street centre, and
+entrance/furniture height queries share the drawn walking surface. Closed sides still reach
+terrain without inverted buried faces; the stored mesh layout is unchanged.
+
+Generator 28 tapers sidewalk endpoint widths with the street and uses actual road triangles
+for carriageway clearance. Partial building overlaps trim their occupied area, preserving
+the clear walking width; drawn building outlines use precomputed triangle masks. Submillimetre
+GPU clipping slivers are discarded before normal generation. Stored format remains 3.
+
+Generator 29 bounds a rounded sidewalk bend's replacement triangle by the original outer
+miter. Its former three-width reach could cut a separate nearby street's sidewalk even
+though the replacement arc remained beside its own street. Stored format remains 3.
+
+Generator 30 shares the straight walking strips' grade fields with their curved joins.
+Every arc section blends the same two parent profiles across its full width, eliminating
+height steps between footprints that already touch. Street-centre anchors supply fallback
+profiles; mapped short sections interpolate their endpoint samples. Stored format remains 3.
+
+Generator 31 clips overlapping walking footprints into one surface. Connected overlap regions
+share a fitted planar grade with smooth approaches, avoiding stacked island paving and
+cracks between different triangulations. Corner pieces require both walking approaches.
+Folded inner offsets are resolved before clipping, and shared profile endpoint heights
+are sampled globally at overlaps and chunk boundaries.
+Temporary grading metadata adds no stored fields; stored format remains 3.
+
+Generator 32 extrudes only exposed sidewalk boundaries, removing internal side walls
+between joined walking pieces. Degenerate clipping edges cannot duplicate paving or invent
+a mask plane. The metadata is temporary; stored format remains 3.
+
+Generator 33 omits inferred raised sidewalk components shorter than 12 m after clipping.
+Connected straight and curved pieces qualify together before chunking, while detached
+remnants qualify separately. Component metadata is temporary; stored format remains 3.

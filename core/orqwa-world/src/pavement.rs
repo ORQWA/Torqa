@@ -39,6 +39,22 @@ impl Barrier {
 }
 
 impl Pavement {
+    /// Actual carriageway footprint in east/north, without the conservative terrain envelope.
+    pub(crate) fn contains(&self, east: f64, north: f64) -> bool {
+        let p = [east, 0.0, -north];
+        self.cells
+            .get(&(cell(east), cell(-north)))
+            .into_iter()
+            .flatten()
+            .any(|&i| {
+                let [a, b, c] = self.triangles[i];
+                let area = cross(a, b, c);
+                [cross(a, b, p), cross(b, c, p), cross(c, a, p)]
+                    .into_iter()
+                    .all(|side| side / area >= -1e-8)
+            })
+    }
+
     pub(crate) fn new(world: &World, track_lengths: impl IntoIterator<Item = usize>) -> Self {
         let mut pavement = Self::default();
         pavement.add(&world.road, [0.0; 3], true, world.road.indices.len());

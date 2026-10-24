@@ -128,6 +128,13 @@ struct Piece {
     appearance: Appearance,
 }
 
+#[derive(Clone, Copy)]
+struct Matched {
+    appearance: Appearance,
+    source: usize,
+    point: (f64, f64),
+}
+
 /// Short pieces indexed once, so matching a long route never scans the entire road network.
 pub(crate) struct Index {
     pieces: Vec<Piece>,
@@ -171,8 +178,30 @@ impl Index {
         direction: (f64, f64),
         surface: Surface,
     ) -> (Appearance, Option<usize>) {
+        self.matched(point, direction, surface).map_or_else(
+            || (Appearance::default(), None),
+            |m| (m.appearance, Some(m.source)),
+        )
+    }
+
+    /// Position on the matched mapped section, rather than just its whole feature ID.
+    pub(crate) fn point_at(
+        &self,
+        point: (f64, f64),
+        direction: (f64, f64),
+        surface: Surface,
+    ) -> Option<(f64, f64)> {
+        self.matched(point, direction, surface).map(|m| m.point)
+    }
+
+    fn matched(
+        &self,
+        point: (f64, f64),
+        direction: (f64, f64),
+        surface: Surface,
+    ) -> Option<Matched> {
         let (cx, cy) = cell(point);
-        let mut best: Option<(f64, Appearance, usize)> = None;
+        let mut best: Option<(f64, Matched)> = None;
         for x in cx - 1..=cx + 1 {
             for y in cy - 1..=cy + 1 {
                 for &i in self.cells.get(&(x, y)).into_iter().flatten() {
@@ -204,12 +233,19 @@ impl Index {
                     }
                     let score = distance + 20.0 * (1.0 - alignment);
                     if best.is_none_or(|b| score < b.0) {
-                        best = Some((score, piece.appearance, piece.source));
+                        best = Some((
+                            score,
+                            Matched {
+                                appearance: piece.appearance,
+                                source: piece.source,
+                                point: (piece.a.0 + t * dx, piece.a.1 + t * dy),
+                            },
+                        ));
                     }
                 }
             }
         }
-        best.map_or_else(|| (Appearance::default(), None), |b| (b.1, Some(b.2)))
+        best.map(|b| b.1)
     }
 }
 

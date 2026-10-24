@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-21
-- Requirements: R105, R106, R112, R89, R101
+- Requirements: R105, R106, R112, R131–R135, R89, R101
 
 ## Context
 
@@ -81,6 +81,136 @@ Its UVs follow the curb in metres, with 75 cm stone joints in the urban shader; 
 surfaces keep their existing material and scale. Normals follow the final beveled and ramped
 surfaces. Corner heights interpolate between their streets, including the ridden road's
 height, and solid sides still follow the terrain's cuts. Stored format 2 is unchanged.
+
+### Shared sidewalk owner amendment (2026-10-24)
+
+Generator 27 keeps the original mapped feature selected for each ridden road segment's
+appearance and its projected position on the matched local map section. A mapped copy of
+that section shares the ridden sidewalk and pavement owner, including when several tile
+features form one street chain. Ownership is indexed at the projected map position, so a
+coarse GPX bend can differ by more than the carriageway width without leaving raw map strips.
+The previous one-metre distance
+test could alternate between mapped and ridden strips, letting them cut each other into
+pieces and leaving duplicate paving on the bank. Identity distinguishes these copies from
+independent streets, shallow joining arms and unridden parallel arms of the same map feature.
+Superseded map centre lines no longer supply phantom clearance cuts through the new walk.
+Temporary source IDs and projected positions are discarded before
+storage; stored format remains 3.
+
+### Street-profile footways amendment (2026-10-24)
+
+Generator 27 gives sidewalk patches their owning street's longitudinal profile. Ridden
+street endpoints use the drawn road's elevations; mapped streets sample their centre line,
+and junction curves sample their road-facing edge. Walking cross-sections stay level rather
+than following a bank cut by another nearby road. Reversing a left-side patch reverses its
+height profile too, so both sides agree on grades and shared cross-sections.
+
+Solid sides still extend into the terrain, including where part of a corner is buried;
+their bottoms stay below their tops rather than creating inverted faces. Lowered access
+and entrance ramps share the street datum. Bench and bin queries return the same drawn
+walking height. No stored fields change; stored format remains 3.
+
+### Width transitions and partial obstructions amendment (2026-10-24)
+
+Generator 28 carries both endpoint widths through each sidewalk section. The walking band,
+shared joins, access offsets and street masks taper together. Clearance uses the existing
+drawn carriageway triangles, indexed before urban generation, rather than the conservative
+terrain-shaping envelope that can extend wider than a changing road.
+
+Partial building overlaps trim only their occupied polygon area. The same drawn outlines
+used by building models and shells are triangulated once, retaining the remaining
+walking strip and closing its exposed edges. Submillimetre clipping slivers that cannot
+retain reliable GPU winding or slope are discarded before computing surface normals.
+This adds no stored fields; stored format remains 3.
+
+### Neighbouring bend clearance amendment (2026-10-24)
+
+Generator 29 bounds each bend's replacement triangle by the original outer miter. For
+outer walking radius R and half-turn h, the miter reaches R/cos(h), while the triangle's
+far edge reaches reach*cos(h). Use reach = R/cos²(h), with a 2 cm clipping allowance.
+The former three-radius triangle could reach a separate hairpin arm, remove its sidewalk
+and leave the replacement arc beside the lower street. The smaller geometric bound keeps
+that unrelated walking surface continuous without changing the rounded corner itself.
+A regression reproduces the gap with two streets 16 m apart. Stored format remains 3.
+
+### Shared corner grades amendment (2026-10-24)
+
+Generator 30 evaluates a curved sidewalk against the height fields of the straight walking
+strips at its tangent cross-sections. Every arc section uses the same two parents and its
+fraction along the whole corner. The blend matches the complete walking width at either
+end, including a sloping miter; sampling the inner edge's ground or just one centre height
+can leave a step even when the footprints touch. Ridden and mapped profile endpoints share
+their original grade, with mapped endpoint samples interpolated along each short section.
+Junction geometry retains street-centre anchors for corners without a surviving parent strip.
+Furniture queries use the same field. Profiles and references are temporary; stored format
+remains 3. Review from street height as well as above: an intact footprint alone cannot
+validate a walking join.
+
+### Continuous islands and connected corners amendment (2026-10-24)
+
+Generator 31 removes overlap between inferred walking footprints before meshing. Offsets
+that fold across themselves in a tight inner bend are resolved to their bounded
+convex footprint before carriageway clipping, rather than passing a self-crossing polygon
+to convex subtraction and triangulation. This also fills the intended walking remainder
+where the available island is narrower than a walking strip.
+
+Connected overlap regions use one fitted grade from their adjoining walking profiles over
+the complete participating pieces, easing back to neighbouring profiles over one sidewalk
+width. Restricting that grade to the intersection leaves a step at the surviving rim.
+Every top inside the shared region lies in the same plane;
+blending separate tessellated tops left cracks and stacked slabs. Deterministic ownership
+keeps a single surface, and exposed edges remain closed. Grades and shared cross-section
+lifts are cached during generation, and furniture height queries use the same grade.
+Connectivity is established from the original footprints before ownership subtraction;
+touching overlap groups share one component. Trimming first can hide connections and give
+different planes to adjoining pieces of the same island.
+Profiles used by overlaps or crossing chunk boundaries pin their missing endpoint heights
+once against the global drawn-ground sampler, before chunks are built. Their straight and
+curved pieces therefore retain the same datum even when an anchor falls outside one chunk's
+refined height grid. Explicit ridden-road heights remain authoritative.
+
+A curved corner requires walking strips at both tangent approaches. A paved junction alone
+cannot create detached sidewalk tiles beside narrow service roads or beyond an urban walk.
+Junction arcs join the existing walking footprint; their broad construction wedges do not
+delete it. Only outer-bend rounding replaces the old miter, following the owning strips
+through shared cross-sections and trimming their connected straight pieces. Neither can
+erase a separate curved band or the opposite side of a turning loop. Actual curve overlaps
+are clipped to a single graded surface instead.
+Every sidewalk is clipped against the carriageway's actual junction fans, including
+fans belonging to another nearby corner. Straight arm ribbons alone omit that rounded
+asphalt and can leave an obsolete sidewalk rim across it inside a small turning loop.
+Two arms of the same continuous mapped street do not get a junction fan: that street
+already draws its own bends. Treating the inside of a loop as a separate intersection
+adds a second corner through its existing sidewalk. Independent joining streets retain
+their fillets.
+Regressions include different road widths, reversed loop geometry, a terrain-chunk boundary
+and a narrow joining arm. Stored format stays 3.
+
+### Exposed sidewalk sides amendment (2026-10-24)
+
+Generator 32 closes only exposed edges of the combined walking footprint. Side segments
+covered by another walking piece are clipped away before extrusion; internal boolean cuts
+and material partitions do not become walls through the tread. Partial exposed segments
+retain their interpolated absolute top height and still meet the drawn terrain.
+Repeated mask vertices and submicrometre edges do not define clipping half-planes: they
+could duplicate an outside polygon or leave an internal wall. Position comparisons allow
+0.1 mm for the already quantised GPU top edges. Stored format remains 3.
+
+### Minimum connected walking length amendment (2026-10-24)
+
+Generator 33 requires 12 m of connected inferred sidewalk after road, junction and building
+clipping and overlap ownership. This removes short isolated remnants without rejecting the
+small sections used to construct a long walk. Connectivity uses the surviving convex pieces
+and shared walking edges, not the original unclipped road, a shared vertex or proximity.
+It is resolved for the whole world before terrain chunking, including curved approaches.
+
+Length follows each strip's longitudinal direction between its walking cross-sections.
+Surviving intervals are combined per source strip and component, so partitions across the
+width do not multiply the length. Arc sections accumulate along the bend. Each disconnected
+remnant qualifies independently; missing parts of its source street add no length.
+Building paths, forecourts and garden walls retain their own rules. No course names or
+coordinates enter the decision. The temporary component index adds no stored fields;
+stored format remains 3.
 
 ## Validation and limits
 

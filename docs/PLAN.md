@@ -647,6 +647,15 @@ physically based materials and light, restyled group by group.
   - [x] Rounded sidewalk corners and kerbs: follow the carriageway's junction arcs, round
     outer bends, trim intersecting surfaces instead of removing whole slabs, and draw a
     separate 18 cm curb-stone border with joints and a beveled lip (R105/R112).
+  - [x] Andermatt sidewalk continuity: one sidewalk owner for offset GPX/map lines,
+    walking surfaces anchored to their street, and continuous clear widths beside obstacles;
+    bounded corner replacement preserves neighbouring walks. Compared the full saved
+    Alpenbrevet route at 209.36 km to go from above and beside the street; connected islands
+    share a grade and only exposed sides close to terrain. Generic width, direction and
+    chunk-boundary regressions plus village, city and Oberalp renders pass (R131–R135).
+  - [x] Minimum inferred sidewalk length: require 12 m of connected walking surface
+    after clipping, across straight/curved sections and chunk boundaries. Omit detached
+    corner and island remnants; preserve long runs and separate building access (R136).
   - [x] City benches (R106): regular candidates on alternate sidewalks, paired bins, placement
     at sidewalk height, clear entrances and junctions; no seats on unsuitable slopes.
   - [x] Buildings: textured plaster, clay tiles, slate, boards, masonry and gravel roofs

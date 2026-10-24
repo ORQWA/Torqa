@@ -46,6 +46,7 @@ struct Segment {
     appearance: Option<Appearance>,
     /// Map feature that supplied the appearance, retained only during generation.
     source: Option<usize>,
+    source_position: Option<(f64, f64)>,
     /// Start and end in metres east/north.
     a: (f64, f64),
     b: (f64, f64),
@@ -105,11 +106,13 @@ pub(crate) struct RoadIndex {
     /// The lines, as ranges of `segments`.
     lines: Vec<std::ops::Range<usize>>,
     cells: HashMap<(i64, i64), Vec<usize>>,
+    source_cells: HashMap<(i64, i64), Vec<usize>>,
 }
 
 impl RoadIndex {
     pub(crate) fn set_appearances(&mut self, index: &Index) {
-        for segment in &mut self.segments {
+        self.source_cells.clear();
+        for (i, segment) in self.segments.iter_mut().enumerate() {
             let point = (
                 f64::midpoint(segment.a.0, segment.b.0),
                 f64::midpoint(segment.a.1, segment.b.1),
@@ -117,6 +120,13 @@ impl RoadIndex {
             let (appearance, source) = index.at(point, direction(segment), segment.surface);
             segment.appearance = Some(appearance);
             segment.source = source;
+            segment.source_position = index.point_at(point, direction(segment), segment.surface);
+            if let Some(point) = segment.source_position {
+                self.source_cells
+                    .entry(cell_of(point.0, point.1))
+                    .or_default()
+                    .push(i);
+            }
         }
         // Ease width changes over roughly twenty metres; material boundaries stay local.
         for line in &self.lines {
@@ -250,6 +260,7 @@ impl RoadIndex {
             segments.extend(line.windows(2).map(|w| Segment {
                 appearance: None,
                 source: None,
+                source_position: None,
                 a: w[0].position,
                 b: w[1].position,
                 elevation_a: w[0].elevation,
@@ -289,6 +300,7 @@ impl RoadIndex {
             segments,
             lines: ranges,
             cells,
+            source_cells: HashMap::new(),
         }
     }
 
@@ -319,8 +331,40 @@ impl RoadIndex {
         })
     }
 
-    /// Whether the ridden road already draws this street. Retaining the matched map feature
-    /// distinguishes a shifted copy of the same carriageway from a shallow joining street.
+    /// A mapped street's footways belong to the ridden carriageway when both describe the
+    /// same map feature. Nearby independent ways and shallow joining arms keep their walks.
+    pub(crate) fn owns_mapped(
+        &self,
+        point: (f64, f64),
+        heading: (f64, f64),
+        sources: &[usize],
+    ) -> bool {
+        let (cx, cy) = cell_of(point.0, point.1);
+        (cx - 1..=cx + 1).any(|x| {
+            (cy - 1..=cy + 1).any(|y| {
+                self.source_cells
+                    .get(&(x, y))
+                    .into_iter()
+                    .flatten()
+                    .any(|&i| {
+                        let segment = &self.segments[i];
+                        let forward = direction(segment);
+                        segment.surface == Surface::Ground
+                            && segment
+                                .source
+                                .is_some_and(|source| sources.contains(&source))
+                            && segment
+                                .source_position
+                                .is_some_and(|p| (point.0 - p.0).hypot(point.1 - p.1) <= SAME_ROAD)
+                            && (forward.0 * heading.0 + forward.1 * heading.1).abs() > 0.8
+                    })
+            })
+        })
+    }
+
+    /// Whether the ridden road already draws this street. Ground junctions require full
+    /// cross-section coverage; a bridge with a matching centre line has one structure even
+    /// when GPX smoothing and map quantisation shift its edges slightly.
     pub(crate) fn covers_street(
         &self,
         point: (f64, f64),
@@ -329,6 +373,9 @@ impl RoadIndex {
         heading: (f64, f64),
         sources: &[usize],
     ) -> bool {
+        if surface == Surface::Ground && self.owns_mapped(point, heading, sources) {
+            return true;
+        }
         self.nearest_segment(point.0, point.1, half + 8.0)
             .is_some_and(|((distance, _, on), index)| {
                 let segment = &self.segments[index];

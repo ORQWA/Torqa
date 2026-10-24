@@ -1,6 +1,7 @@
 //! Inferred urban paving and building access (R105, R112). Geometry follows the drawn terrain;
 //! mapped green spaces and infrastructure take precedence over inferred surroundings.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use orqwa_osm::LandCover;
@@ -15,6 +16,7 @@ use crate::{CHUNK_SIZE, HeightGrid, MeshData, On, ROAD_SINK, drape, palette};
 
 const CELL: f64 = 50.0;
 const WALK_WIDTH: f64 = 1.8;
+const MIN_WALK_LENGTH: f64 = 12.0;
 const CURB_HEIGHT: f64 = 0.14;
 const CURB_WIDTH: f64 = 0.18;
 const CURB_BEVEL: f64 = 0.025;
@@ -46,6 +48,7 @@ impl Material {
 
 struct Site {
     outline: Vec<Point>,
+    cuts: Vec<[Point; 3]>,
     center: Point,
     area: f64,
     business: bool,
@@ -57,7 +60,34 @@ struct Way {
     a: Point,
     b: Point,
     half: f64,
+    end_half: f64,
     lift: f64,
+    elevations: Option<[f64; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct Profile {
+    a: Point,
+    b: Point,
+    elevations: [Option<f64>; 2],
+    span: [f64; 2],
+}
+
+impl Way {
+    fn half_at(self, point: Point) -> f64 {
+        let along =
+            distance(self.a, project(point, self.a, self.b)) / distance(self.a, self.b).max(0.01);
+        self.half + (self.end_half - self.half) * along
+    }
+
+    fn profile(self) -> Profile {
+        Profile {
+            a: self.a,
+            b: self.b,
+            elevations: self.elevations.map_or([None; 2], |ends| ends.map(Some)),
+            span: [0.0, 1.0],
+        }
+    }
 }
 
 struct Patch {
@@ -69,33 +99,107 @@ struct Patch {
     wall: bool,
     /// Access paths rise gently to meet their street and the lowered sidewalk opening.
     ramp: Option<(Point, Point, f64)>,
+    /// Walking surfaces follow their street, not a bank cut by another nearby road.
+    profile: Option<Profile>,
 }
 
 #[derive(Clone, Copy)]
 struct CurveSection {
-    zone: usize,
     lifts: [f64; 2],
+    parents: [Option<usize>; 2],
+    span: [f64; 2],
 }
+
+struct Merge {
+    masks: Vec<Vec<Point>>,
+    patches: Vec<usize>,
+}
+
+type Grade = (Point, [f64; 3]);
+type Grades = RefCell<HashMap<usize, Grade>>;
 
 /// Immutable, spatially indexed urban surfaces, shared by all chunk builders.
 #[derive(Default)]
 pub(crate) struct Urban {
+    pavement: crate::pavement::Pavement,
     sites: Vec<Site>,
     site_cells: HashMap<(i64, i64), Vec<usize>>,
     building_cells: HashMap<(i64, i64), Vec<usize>>,
     ways: Vec<Way>,
     way_cells: HashMap<(i64, i64), Vec<usize>>,
+    covered: HashMap<(i64, i64), Vec<(Point, Point)>>,
     patches: Vec<Patch>,
     patch_cells: HashMap<(i64, i64), Vec<usize>>,
     chunk_cells: HashMap<(i64, i64), Vec<usize>>,
     curves: HashMap<usize, CurveSection>,
     zones: Vec<Vec<Point>>,
+    zone_owners: Vec<Vec<usize>>,
     zone_cells: HashMap<(i64, i64), Vec<usize>>,
+    junctions: Vec<Vec<Point>>,
+    junction_cells: HashMap<(i64, i64), Vec<usize>>,
     shapes: Vec<Vec<Vec<Point>>>,
+    merges: Vec<Merge>,
+    merge_cells: HashMap<(i64, i64), Vec<usize>>,
+    ends: Vec<[f64; 2]>,
 }
 
 // Kept outside the builder so its decisions can be queried identically by terrain and plants.
 impl Urban {
+    pub(crate) fn grade_points(&self) -> Vec<Point> {
+        let mut needed = vec![false; self.patches.len()];
+        for group in &self.merges {
+            for &i in &group.patches {
+                needed[i] = true;
+            }
+        }
+        for (i, patch) in self.patches.iter().enumerate() {
+            if patch.curb && cells(&patch.polygon, CHUNK_SIZE, 0.0).len() > 1 {
+                needed[i] = true;
+            }
+        }
+        for (&i, curve) in &self.curves {
+            if needed[i] {
+                for parent in curve.parents.into_iter().flatten() {
+                    needed[parent] = true;
+                }
+            }
+        }
+        let mut points = Vec::new();
+        for (i, patch) in self.patches.iter().enumerate() {
+            if needed[i]
+                && let Some(profile) = patch.profile
+            {
+                for (p, y) in [profile.a, profile.b].into_iter().zip(profile.elevations) {
+                    if y.is_none() {
+                        points.push(p);
+                    }
+                }
+            }
+        }
+        points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        points.dedup_by(|a, b| a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits());
+        points
+    }
+
+    pub(crate) fn pin_grades(&mut self, samples: impl IntoIterator<Item = (Point, f64)>) {
+        let samples: HashMap<_, _> = samples
+            .into_iter()
+            .map(|(p, y)| ((p.0.to_bits(), p.1.to_bits()), y))
+            .collect();
+        for patch in &mut self.patches {
+            if let Some(profile) = &mut patch.profile {
+                for (p, y) in [profile.a, profile.b]
+                    .into_iter()
+                    .zip(&mut profile.elevations)
+                {
+                    if y.is_none() {
+                        *y = samples.get(&(p.0.to_bits(), p.1.to_bits())).copied();
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn build<'a>(
         plots: impl Iterator<Item = &'a Plot<'a>>,
         streets: &[Street],
@@ -103,12 +207,24 @@ impl Urban {
         clearance: &Clearance,
         road: &RoadIndex,
         land: &LandIndex,
+        pavement: crate::pavement::Pavement,
     ) -> Self {
         let mut plots: Vec<_> = plots.collect();
         plots.sort_by_key(|plot| plot.building.id);
-        let mut urban = Self::default();
+        let mut urban = Self {
+            pavement,
+            ..Self::default()
+        };
         for plot in plots {
             let outline = buildings::drawn_outline(&plot.footprint);
+            let mut mask = outline.clone();
+            if signed_area(&mask) < 0.0 {
+                mask.reverse();
+            }
+            let cuts = buildings::triangulate(&mask)
+                .into_iter()
+                .map(|tri| tri.map(|i| mask[i as usize]))
+                .collect();
             let center = centroid(&outline);
             let area = polygon_area(&outline);
             let index = urban.sites.len();
@@ -122,6 +238,7 @@ impl Urban {
             }
             urban.sites.push(Site {
                 outline,
+                cuts,
                 center,
                 area,
                 business: plot.shop.is_some()
@@ -135,9 +252,20 @@ impl Urban {
         }
         urban.collect_ways(streets, road);
         urban.walks(land);
-        urban.corner_walks(corners, land);
+        urban.corner_walks(corners, land, road);
         urban.bend_walks(land);
         urban.accesses(land);
+        for corner in corners {
+            let outline: Vec<_> = corner.outline().collect();
+            for pair in outline[1..].windows(2) {
+                let triangle = vec![outline[0], pair[0], pair[1]];
+                let index = urban.junctions.len();
+                for key in cells(&triangle, CELL, 0.0) {
+                    urban.junction_cells.entry(key).or_default().push(index);
+                }
+                urban.junctions.push(triangle);
+            }
+        }
         urban.finish(land, clearance, road);
         urban
     }
@@ -150,14 +278,22 @@ impl Urban {
             for pair in street.points().windows(2) {
                 let direction = direction(pair[0], pair[1]);
                 let middle = midpoint(pair[0], pair[1]);
-                if road.runs_along(middle.0, middle.1, 1.0, direction) {
+                if road.owns_mapped(middle, direction, street.sources()) {
+                    for key in cells(pair, CELL, 0.0) {
+                        self.covered
+                            .entry(key)
+                            .or_default()
+                            .push((pair[0], pair[1]));
+                    }
                     continue;
                 }
                 self.add_way(Way {
                     a: pair[0],
                     b: pair[1],
                     half: street.half_width(),
+                    end_half: street.half_width(),
                     lift: street.lift(),
+                    elevations: None,
                 });
             }
         }
@@ -173,7 +309,9 @@ impl Urban {
                 a: pair[0].position,
                 b: pair[1].position,
                 half: pair[0].appearance.width / 2.0,
+                end_half: pair[1].appearance.width / 2.0,
                 lift: ROAD_SINK,
+                elevations: Some([pair[0].elevation - ROAD_SINK, pair[1].elevation - ROAD_SINK]),
             });
         }
     }
@@ -242,11 +380,12 @@ impl Urban {
                     (p.0 + right.0 * width * sign, p.1 + right.1 * width * sign)
                 };
                 let inner = way.half + GAP;
+                let end_inner = way.end_half + GAP;
                 self.add_patch(Patch {
                     polygon: vec![
                         offset(way.a, start, inner),
-                        offset(way.b, end, inner),
-                        offset(way.b, end, inner + WALK_WIDTH),
+                        offset(way.b, end, end_inner),
+                        offset(way.b, end, end_inner + WALK_WIDTH),
                         offset(way.a, start, inner + WALK_WIDTH),
                     ],
                     material: Material::Concrete,
@@ -254,39 +393,97 @@ impl Urban {
                     curb: true,
                     wall: false,
                     ramp: None,
+                    profile: Some(way.profile()),
                 });
             }
         }
     }
 
-    fn corner_walks(&mut self, corners: &[Corner], land: &LandIndex) {
+    fn corner_walks(&mut self, corners: &[Corner], land: &LandIndex, road: &RoadIndex) {
         for corner in corners {
             if let Some(footway) = corner.footway(GAP, WALK_WIDTH)
                 && self.urban_at(centroid(&footway.zone), land)
             {
-                self.add_curve(footway);
+                let elevations = footway.bases.map(|(p, ridden)| {
+                    ridden
+                        .then(|| {
+                            road.nearest(p.0, p.1, 12.0)
+                                .map(|(_, height, _)| height - ROAD_SINK)
+                        })
+                        .flatten()
+                });
+                let profile = Profile {
+                    a: footway.bases[0].0,
+                    b: footway.bases[1].0,
+                    elevations,
+                    span: [0.0, 1.0],
+                };
+                self.add_curve(footway, profile, false);
             }
         }
     }
 
-    fn add_curve(&mut self, mut footway: FootwayCorner) {
+    fn add_curve(&mut self, mut footway: FootwayCorner, profile: Profile, replace: bool) {
+        let parent = |point: Point| {
+            Self::near(&self.patch_cells, point, 0.1)
+                .filter(|&index| self.patches[index].curb && !self.curves.contains_key(&index))
+                .map(|index| (polygon_distance(&self.patches[index].polygon, point), index))
+                .filter(|&(distance, _)| distance < 0.1)
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                .map(|(_, index)| index)
+        };
+        let parents = [
+            footway
+                .sections
+                .first()
+                .and_then(|s| parent(midpoint(s.polygon[0], s.polygon[3]))),
+            footway
+                .sections
+                .last()
+                .and_then(|s| parent(midpoint(s.polygon[1], s.polygon[2]))),
+        ];
+        // A fillet cannot justify a sidewalk by itself. Both walking approaches must
+        // exist, including on service arms and at the edge of an urban area.
+        if parents.iter().any(Option::is_none) {
+            return;
+        }
         if signed_area(&footway.zone) > 0.0 {
             footway.zone.reverse();
         }
-        let zone = self.zones.len();
-        for key in cells(&footway.zone, CELL, 0.0) {
-            self.zone_cells.entry(key).or_default().push(zone);
+        if replace {
+            let zone = self.zones.len();
+            self.zone_owners
+                .push(self.replacement_owners(&footway.zone, parents));
+            for key in cells(&footway.zone, CELL, 0.0) {
+                self.zone_cells.entry(key).or_default().push(zone);
+            }
+            self.zones.push(footway.zone);
         }
-        self.zones.push(footway.zone);
-        for FootwaySection { polygon, mut lifts } in footway.sections {
+        for FootwaySection {
+            polygon,
+            mut lifts,
+            span,
+        } in footway.sections
+        {
             for lift in &mut lifts {
                 *lift += CURB_HEIGHT;
             }
             if signed_area(&polygon) > 0.0 {
                 lifts.reverse();
             }
-            self.curves
-                .insert(self.patches.len(), CurveSection { zone, lifts });
+            let curve_span = if signed_area(&polygon) > 0.0 {
+                [span[1], span[0]]
+            } else {
+                span
+            };
+            self.curves.insert(
+                self.patches.len(),
+                CurveSection {
+                    lifts,
+                    parents,
+                    span: curve_span,
+                },
+            );
             self.add_patch(Patch {
                 polygon,
                 material: Material::Concrete,
@@ -294,8 +491,41 @@ impl Urban {
                 curb: true,
                 wall: false,
                 ramp: None,
+                profile: Some(Profile { span, ..profile }),
             });
         }
+    }
+
+    fn replacement_owners(&self, zone: &[Point], parents: [Option<usize>; 2]) -> Vec<usize> {
+        let mut pending: Vec<_> = parents.into_iter().flatten().collect();
+        let mut owners = Vec::new();
+        while let Some(i) = pending.pop() {
+            if owners.contains(&i) {
+                continue;
+            }
+            owners.push(i);
+            let p = &self.patches[i].polygon;
+            for (a, b) in [(p[0], p[3]), (p[1], p[2])] {
+                for other in Self::near(&self.patch_cells, midpoint(a, b), 0.001) {
+                    if owners.contains(&other)
+                        || !self.patches[other].curb
+                        || self.curves.contains_key(&other)
+                    {
+                        continue;
+                    }
+                    let p = &self.patches[other].polygon;
+                    let joins = [(p[0], p[3]), (p[1], p[2])].into_iter().any(|(c, d)| {
+                        (distance(a, c) < 0.0001 && distance(b, d) < 0.0001)
+                            || (distance(a, d) < 0.0001 && distance(b, c) < 0.0001)
+                    });
+                    if joins && overlaps(p, zone) {
+                        pending.push(other);
+                    }
+                }
+            }
+        }
+        owners.sort_unstable();
+        owners
     }
 
     fn bend_walks(&mut self, land: &LandIndex) {
@@ -313,6 +543,16 @@ impl Urban {
                     continue;
                 }
                 let other = self.ways[*other];
+                let at_end = |way: Way| {
+                    way.elevations
+                        .map(|ends| ends[usize::from(distance(way.b, point) < 1e-6)])
+                };
+                let profile = Profile {
+                    a: point,
+                    b: point,
+                    elevations: [at_end(way), at_end(other)],
+                    span: [0.0, 1.0],
+                };
                 let from = if distance(other.a, point) < 1e-6 {
                     other.b
                 } else {
@@ -331,7 +571,7 @@ impl Urban {
                 }
                 let side = turn.signum();
                 let start = (-before.0 * side).atan2(before.1 * side);
-                let inner = way.half + GAP;
+                let inner = way.half_at(point) + GAP;
                 let radial = |angle: f64, radius: f64| {
                     (
                         point.0 + angle.cos() * radius,
@@ -341,8 +581,12 @@ impl Urban {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a short arc
                 let count = (turn.abs() / 0.12).ceil() as usize;
                 #[allow(clippy::cast_precision_loss)] // a short arc
-                let angle = |i: usize| start + turn * i as f64 / count as f64;
-                let reach = (inner + WALK_WIDTH) * 3.0;
+                let fraction = |i: usize| i as f64 / count as f64;
+                let angle = |i: usize| start + turn * fraction(i);
+                // Enclose the original outer miter, not the neighbouring street. At the
+                // bisector the miter reaches R/cos(half_turn), while this triangle's far
+                // edge reaches reach*cos(half_turn).
+                let reach = (inner + WALK_WIDTH) / (turn / 2.0).cos().powi(2) + 0.02;
                 let zone = vec![point, radial(start, reach), radial(start + turn, reach)];
                 let sections = (0..count)
                     .map(|i| FootwaySection {
@@ -353,16 +597,29 @@ impl Urban {
                             radial(angle(i), inner + WALK_WIDTH),
                         ],
                         lifts: [way.lift; 2],
+                        span: [fraction(i), fraction(i + 1)],
                     })
                     .collect();
-                self.add_curve(FootwayCorner { zone, sections });
+                self.add_curve(
+                    FootwayCorner {
+                        bases: [(point, false); 2],
+                        zone,
+                        sections,
+                    },
+                    profile,
+                    true,
+                );
             }
         }
     }
 
     fn finish(&mut self, land: &LandIndex, clearance: &Clearance, road: &RoadIndex) {
         for (index, patch) in self.patches.iter().enumerate() {
-            let mut shapes = vec![patch.polygon.clone()];
+            let mut shapes = vec![if patch.curb {
+                convex_hull(&patch.polygon)
+            } else {
+                patch.polygon.clone()
+            }];
             if patch.curb {
                 let mut zones: Vec<_> = cells(&patch.polygon, CELL, 0.0)
                     .into_iter()
@@ -371,10 +628,8 @@ impl Urban {
                 zones.sort_unstable();
                 zones.dedup();
                 for zone in zones {
-                    if self
-                        .curves
-                        .get(&index)
-                        .is_some_and(|curve| zone >= curve.zone)
+                    if self.curves.contains_key(&index)
+                        || self.zone_owners[zone].binary_search(&index).is_err()
                     {
                         continue;
                     }
@@ -390,11 +645,210 @@ impl Urban {
                     let way = self.ways[way];
                     // Cut only the part occupying another carriageway, rather than
                     // discarding the whole slab and exposing square, disconnected ends.
-                    shapes = subtract_all(shapes, &ribbon(way.a, way.b, way.half + 0.04));
+                    shapes = subtract_all(shapes, &way_ribbon(way, 0.04));
+                }
+                // Rounded carriageway fans occupy more than the straight arm ribbons.
+                // Their old inner sidewalk miters must not survive as detached rims.
+                let mut junctions: Vec<_> = cells(&patch.polygon, CELL, 0.0)
+                    .into_iter()
+                    .flat_map(|key| self.junction_cells.get(&key).into_iter().flatten().copied())
+                    .collect();
+                junctions.sort_unstable();
+                junctions.dedup();
+                for junction in junctions {
+                    shapes = subtract_all(shapes, &self.junctions[junction]);
+                }
+                let mut sites: Vec<_> = cells(&patch.polygon, CELL, 0.0)
+                    .into_iter()
+                    .flat_map(|key| self.building_cells.get(&key).into_iter().flatten().copied())
+                    .collect();
+                sites.sort_unstable();
+                sites.dedup();
+                for site in sites {
+                    for mask in &self.sites[site].cuts {
+                        // Keep the walking width that remains beside a protruding wall.
+                        shapes = subtract_all(shapes, mask);
+                    }
                 }
             }
             shapes.retain(|polygon| self.clear_polygon(polygon, land, clearance, road));
             self.shapes.push(shapes);
+        }
+        self.ends = (0..self.patches.len()).map(|i| self.walk_ends(i)).collect();
+        self.merge_walks();
+    }
+
+    fn merge_walks(&mut self) {
+        let mut links: Vec<_> = (0..self.patches.len()).collect();
+        let mut overlaps = Vec::new();
+        let mut neighbours = Vec::with_capacity(self.patches.len());
+        // A tight island can bring opposite footways over the same ground. Keep one top
+        // there, with a common grade, rather than intersecting separate slabs.
+        for index in 0..self.patches.len() {
+            let patch = &self.patches[index];
+            if !patch.curb {
+                neighbours.push(Vec::new());
+                continue;
+            }
+            let mut others: Vec<_> = cells(&patch.polygon, CELL, 0.0)
+                .into_iter()
+                .flat_map(|key| self.patch_cells.get(&key).into_iter().flatten().copied())
+                .filter(|&other| other < index && self.patches[other].curb)
+                .collect();
+            others.sort_unstable();
+            others.dedup();
+            for &other in &others {
+                let overlap = split_by_mask(
+                    &convex_hull(&patch.polygon),
+                    &convex_hull(&self.patches[other].polygon),
+                )
+                .1;
+                if !self.shapes[index].is_empty()
+                    && !self.shapes[other].is_empty()
+                    && polygon_area(&overlap) > 0.00001
+                {
+                    let (a, b) = (root(&links, index), root(&links, other));
+                    links[a.max(b)] = a.min(b);
+                    overlaps.push((index, other));
+                }
+            }
+            neighbours.push(others);
+        }
+        // Establish connectivity before subtracting any owner. Otherwise a piece already
+        // claimed by an earlier one can hide a connection and split one island's grade.
+        let mut involved = vec![false; self.patches.len()];
+        for &(a, b) in &overlaps {
+            involved[a] = true;
+            involved[b] = true;
+        }
+        for (index, others) in neighbours.iter().enumerate() {
+            if !involved[index] {
+                continue;
+            }
+            for &other in others {
+                if involved[other]
+                    && self.patches[index].polygon.iter().any(|&p| {
+                        polygon_distance(&convex_hull(&self.patches[other].polygon), p) < 1e-6
+                    })
+                {
+                    let (a, b) = (root(&links, index), root(&links, other));
+                    links[a.max(b)] = a.min(b);
+                }
+            }
+        }
+        for (index, others) in neighbours.into_iter().enumerate() {
+            let mut shapes = std::mem::take(&mut self.shapes[index]);
+            for other in others {
+                for mask in &self.shapes[other] {
+                    shapes = subtract_all(shapes, mask);
+                }
+            }
+            self.shapes[index] = shapes;
+        }
+        self.retain_walk_runs();
+        let mut groups = HashMap::new();
+        for (a, b) in overlaps {
+            let group = *groups.entry(root(&links, a)).or_insert_with(|| {
+                self.merges.push(Merge {
+                    masks: Vec::new(),
+                    patches: Vec::new(),
+                });
+                self.merges.len() - 1
+            });
+            self.merges[group].patches.extend([a, b]);
+        }
+        for (index, group) in self.merges.iter_mut().enumerate() {
+            group.patches.sort_unstable();
+            group.patches.dedup();
+            // The whole participating piece shares the grade, including its exposed rim.
+            // Restricting the common plane to the intersection leaves steps beside it.
+            group.masks = group
+                .patches
+                .iter()
+                .map(|&i| convex_hull(&self.patches[i].polygon))
+                .collect();
+            for mask in &group.masks {
+                for key in cells(mask, CELL, WALK_WIDTH) {
+                    self.merge_cells.entry(key).or_default().push(index);
+                }
+            }
+        }
+        for groups in self.merge_cells.values_mut() {
+            groups.sort_unstable();
+            groups.dedup();
+        }
+    }
+
+    fn retain_walk_runs(&mut self) {
+        // Work on the surviving footprint, before chunking. A single source strip can
+        // leave several disconnected remnants; many short strips can form one long walk.
+        let pieces: Vec<_> = self
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| self.patches[i].curb)
+            .flat_map(|(i, shapes)| (0..shapes.len()).map(move |j| (i, j)))
+            .collect();
+        let mut links: Vec<_> = (0..pieces.len()).collect();
+        let mut index: HashMap<_, Vec<usize>> = HashMap::new();
+        for (i, &(patch, shape)) in pieces.iter().enumerate() {
+            let polygon = &self.shapes[patch][shape];
+            let keys = cells(polygon, CELL, 0.0001);
+            let mut neighbours: Vec<_> = keys
+                .iter()
+                .flat_map(|key| index.get(key).into_iter().flatten().copied())
+                .collect();
+            neighbours.sort_unstable();
+            neighbours.dedup();
+            for other in neighbours {
+                let (p, s) = pieces[other];
+                // A shared corner alone is not a usable walking connection.
+                if walking_connection(polygon, &self.shapes[p][s]) {
+                    let (a, b) = (root(&links, i), root(&links, other));
+                    links[a.max(b)] = a.min(b);
+                }
+            }
+            for key in keys {
+                index.entry(key).or_default().push(i);
+            }
+        }
+        let mut spans: HashMap<_, Vec<(f64, f64)>> = HashMap::new();
+        for (i, &(patch, shape)) in pieces.iter().enumerate() {
+            let p = &self.patches[patch].polygon;
+            let (a, b) = (midpoint(p[0], p[3]), midpoint(p[1], p[2]));
+            let d = direction(a, b);
+            let along =
+                |p: Point| ((p.0 - a.0) * d.0 + (p.1 - a.1) * d.1).clamp(0.0, distance(a, b));
+            let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &p in &self.shapes[patch][shape] {
+                low = low.min(along(p));
+                high = high.max(along(p));
+            }
+            spans
+                .entry((root(&links, i), patch))
+                .or_default()
+                .push((low, high));
+        }
+        let mut lengths = vec![0.0; pieces.len()];
+        // Boolean clipping can partition a strip across its width. Count each surviving
+        // longitudinal interval once, rather than counting its tessellation or perimeter.
+        let mut spans: Vec<_> = spans.into_iter().collect();
+        spans.sort_by_key(|(key, _)| *key);
+        for ((group, _), mut intervals) in spans {
+            intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut end = 0.0_f64;
+            for (low, high) in intervals {
+                lengths[group] += (high - low.max(end)).max(0.0);
+                end = end.max(high);
+            }
+        }
+        let mut keep: Vec<_> = self.shapes.iter().map(|s| vec![true; s.len()]).collect();
+        for (i, &(patch, shape)) in pieces.iter().enumerate() {
+            keep[patch][shape] = lengths[root(&links, i)] + 1e-6 >= MIN_WALK_LENGTH;
+        }
+        for (shapes, keep) in self.shapes.iter_mut().zip(keep) {
+            let mut flags = keep.into_iter();
+            shapes.retain(|_| flags.next().unwrap_or(false));
         }
     }
 
@@ -431,7 +885,7 @@ impl Urban {
             .filter(|&other| {
                 let candidate = self.ways[other];
                 other != index
-                    && (candidate.half - way.half).abs() < 1e-6
+                    && (candidate.half_at(point) - way.half_at(point)).abs() < 1e-6
                     && (candidate.lift - way.lift).abs() < 1e-6
                     && (distance(candidate.a, point) < 1e-6 || distance(candidate.b, point) < 1e-6)
             })
@@ -459,13 +913,14 @@ impl Urban {
                 .expect("a building outline");
             let door = midpoint(edge.0, edge.1);
             let reach = distance(door, street);
-            if reach <= way.half + GAP || reach > ACCESS_REACH {
+            let half = way.half_at(street);
+            if reach <= half + GAP || reach > ACCESS_REACH {
                 continue;
             }
             let to_street = direction(door, street);
             let end = (
-                street.0 - to_street.0 * (way.half + GAP),
-                street.1 - to_street.1 * (way.half + GAP),
+                street.0 - to_street.0 * (half + GAP),
+                street.1 - to_street.1 * (half + GAP),
             );
             let business = site.business;
             let town = site.town;
@@ -486,6 +941,7 @@ impl Urban {
                 curb: false,
                 wall: false,
                 ramp: None,
+                profile: None,
             });
             let half = if business { 1.7 } else { 0.75 };
             self.add_patch(Patch {
@@ -499,10 +955,11 @@ impl Urban {
                 curb: false,
                 wall: false,
                 ramp: Some((door, end, way.lift + 0.005)),
+                profile: Some(way.profile()),
             });
             // Small front-garden walls leave a broad opening for the access, inferred from
             // the house and road rather than pretending cadastral boundaries are mapped.
-            if town && !business && area < 300.0 && reach > way.half + WALK_WIDTH + 4.0 {
+            if town && !business && area < 300.0 && reach > half + WALK_WIDTH + 4.0 {
                 let at = (
                     end.0 - to_street.0 * (WALK_WIDTH + 0.7),
                     end.1 - to_street.1 * (WALK_WIDTH + 0.7),
@@ -517,6 +974,7 @@ impl Urban {
                         curb: false,
                         wall: true,
                         ramp: None,
+                        profile: None,
                     });
                 }
             }
@@ -529,6 +987,11 @@ impl Urban {
             patch.polygon.reverse();
             if patch.curb {
                 patch.polygon.rotate_left(2);
+                if let Some(profile) = &mut patch.profile {
+                    std::mem::swap(&mut profile.a, &mut profile.b);
+                    profile.elevations.swap(0, 1);
+                    profile.span = [1.0 - profile.span[1], 1.0 - profile.span[0]];
+                }
             }
         }
         let index = self.patches.len();
@@ -588,7 +1051,7 @@ impl Urban {
     }
 
     /// Height above terrain of a clear sidewalk, excluding entrance paths through it.
-    pub(crate) fn sidewalk_lift(&self, point: Point) -> Option<f64> {
+    pub(crate) fn sidewalk_lift(&self, point: Point, heights: &HeightGrid) -> Option<f64> {
         self.patch_cells
             .get(&cell(point, CELL))?
             .iter()
@@ -601,7 +1064,10 @@ impl Urban {
                         .any(|shape| contains(shape, point))
                     && !self.access_crosses(&patch.polygon, true)
             })
-            .map(|index| walk_lift(&self.patches[index], self.walk_ends(index), point))
+            .map(|index| {
+                self.walk_height(index, point, heights, &Grades::default())
+                    - heights.at(point.0, point.1)
+            })
             .max_by(f64::total_cmp)
     }
 
@@ -611,7 +1077,23 @@ impl Urban {
             .map_or([self.patches[index].lift; 2], |curve| curve.lifts)
     }
 
+    fn walk_base(&self, index: usize, point: Point, heights: &HeightGrid) -> f64 {
+        let patch = &self.patches[index];
+        let fallback = || walk_base(patch, point, heights);
+        let Some(curve) = self.curves.get(&index) else {
+            return fallback();
+        };
+        let [start, end] = curve.parents.map(|parent| {
+            parent.map_or_else(fallback, |i| walk_base(&self.patches[i], point, heights))
+        });
+        let along = curve.span[0] + (curve.span[1] - curve.span[0]) * walk_fraction(patch, point);
+        start + (end - start) * along
+    }
+
     fn walk_ends(&self, index: usize) -> [f64; 2] {
+        if let Some(&ends) = self.ends.get(index) {
+            return ends;
+        }
         let patch = &self.patches[index];
         let base = self.base_lifts(index);
         let end_lift = |point, lift| {
@@ -635,6 +1117,84 @@ impl Urban {
         ]
     }
 
+    fn walk_height(
+        &self,
+        index: usize,
+        point: Point,
+        heights: &HeightGrid,
+        grades: &Grades,
+    ) -> f64 {
+        let raw = self.walk_base(index, point, heights)
+            + walk_lift(&self.patches[index], self.walk_ends(index), point);
+        let (mut total, mut weight) = (0.0, 0.0);
+        for &group in self
+            .merge_cells
+            .get(&cell(point, CELL))
+            .into_iter()
+            .flatten()
+        {
+            let distance = self.merges[group]
+                .masks
+                .iter()
+                .map(|mask| polygon_distance(mask, point))
+                .fold(f64::MAX, f64::min);
+            let share = (1.0 - distance / WALK_WIDTH).clamp(0.0, 1.0);
+            let share = share * share * (3.0 - 2.0 * share);
+            if share > 0.0 {
+                let (centre, plane) = *grades
+                    .borrow_mut()
+                    .entry(group)
+                    .or_insert_with(|| self.merge_grade(group, heights));
+                total +=
+                    (plane[0] + plane[1] * (point.0 - centre.0) + plane[2] * (point.1 - centre.1))
+                        * share;
+                weight += share;
+            }
+        }
+        if weight > 0.0 {
+            raw * (1.0 - weight.min(1.0)) + total / weight * weight.min(1.0)
+        } else {
+            raw
+        }
+    }
+
+    fn merge_grade(&self, group: usize, heights: &HeightGrid) -> Grade {
+        let samples: Vec<_> = self.merges[group]
+            .patches
+            .iter()
+            .flat_map(|&i| {
+                self.patches[i].polygon.iter().map(move |&p| {
+                    (
+                        p,
+                        self.walk_base(i, p, heights)
+                            + walk_lift(&self.patches[i], self.walk_ends(i), p),
+                    )
+                })
+            })
+            .collect();
+        let centre = centroid(&samples.iter().map(|s| s.0).collect::<Vec<_>>());
+        #[allow(clippy::cast_precision_loss)] // bounded local patch group
+        let mean = samples.iter().map(|s| s.1).sum::<f64>() / samples.len() as f64;
+        let (mut xx, mut zz, mut xz, mut xy, mut zy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (p, y) in samples {
+            let (x, z) = (p.0 - centre.0, p.1 - centre.1);
+            xx += x * x;
+            zz += z * z;
+            xz += x * z;
+            xy += x * (y - mean);
+            zy += z * (y - mean);
+        }
+        let det = xx * zz - xz * xz;
+        let (dx, dz) = if det > 1e-9 {
+            ((xy * zz - zy * xz) / det, (zy * xx - xy * xz) / det)
+        } else if xx > zz {
+            (xy / xx.max(1e-9), 0.0)
+        } else {
+            (0.0, zy / zz.max(1e-9))
+        };
+        (centre, [mean, dx, dz])
+    }
+
     fn clear_polygon(
         &self,
         polygon: &[Point],
@@ -650,7 +1210,7 @@ impl Urban {
                     road.edge_distance(east, north) >= 0.5 && !self.on_way((east, north), true)
                 })
                 && !self.on_way(point, false)
-                && road.edge_distance(point.0, point.1) >= 0.02
+                && !self.pavement.contains(point.0, point.1)
                 && !self.in_building(point)
         };
         // Furniture and mesh generation must agree about which sidewalk pieces exist.
@@ -664,15 +1224,68 @@ impl Urban {
     }
 
     fn on_way(&self, point: Point, center_only: bool) -> bool {
+        if center_only
+            && self.covered.get(&cell(point, CELL)).is_some_and(|lines| {
+                lines
+                    .iter()
+                    .any(|&(a, b)| distance(point, project(point, a, b)) < 0.001)
+            })
+        {
+            return true;
+        }
         Self::near(&self.way_cells, point, 4.0).any(|index| {
             let way = self.ways[index];
-            let reach = if center_only { 0.001 } else { way.half + 0.02 };
+            let reach = if center_only {
+                0.001
+            } else {
+                way.half_at(point) + 0.02
+            };
             distance(point, project(point, way.a, way.b)) < reach
         })
     }
 
+    fn exposed_walk_edge(&self, a: Point, b: Point, current: &[Point]) -> Vec<(Point, Point)> {
+        let mut spans = vec![(0.0_f64, 1.0_f64)];
+        let mut neighbours: Vec<_> = cells(&[a, b], CELL, 0.01)
+            .into_iter()
+            .flat_map(|key| self.patch_cells.get(&key).into_iter().flatten().copied())
+            .collect();
+        neighbours.sort_unstable();
+        neighbours.dedup();
+        for index in neighbours {
+            if !self.patches[index].curb {
+                continue;
+            }
+            for shape in &self.shapes[index] {
+                if std::ptr::eq(shape.as_slice(), current) {
+                    continue;
+                }
+                if let Some((low, high)) = segment_inside(a, b, shape) {
+                    spans = spans
+                        .into_iter()
+                        .flat_map(|(start, end)| {
+                            [(start, end.min(low)), (start.max(high), end)]
+                                .into_iter()
+                                .filter(|&(a, b)| b - a > 1e-8)
+                        })
+                        .collect();
+                }
+            }
+            if spans.is_empty() {
+                break;
+            }
+        }
+        let along = |t: f64| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        spans
+            .into_iter()
+            .map(|(a, b)| (along(a), along(b)))
+            .filter(|&(a, b)| distance(a, b) > 1e-4)
+            .collect()
+    }
+
     pub(crate) fn mesh(&self, heights: &HeightGrid, origin: [f64; 3]) -> MeshData {
         let mut mesh = MeshData::default();
+        let grades = Grades::default();
         for &index in self
             .chunk_cells
             .get(&cell(heights.origin, CHUNK_SIZE))
@@ -695,24 +1308,26 @@ impl Urban {
             {
                 continue;
             }
-            let lift = patch.lift;
-            let ends = if patch.curb {
-                self.walk_ends(index)
-            } else {
-                [lift; 2]
-            };
             for shape in &self.shapes[index] {
                 for (polygon, material) in top_parts(patch, shape) {
                     let first_index = patch_top(
                         &mut mesh,
                         patch,
                         &polygon,
-                        ends,
                         material,
                         (heights, origin),
+                        &|point| self.walk_height(index, point, heights, &grades),
                     );
                     if patch.curb {
-                        walk_sides(&mut mesh, first_index, shape, patch, heights, origin);
+                        walk_sides(
+                            &mut mesh,
+                            first_index,
+                            shape,
+                            patch,
+                            heights,
+                            origin,
+                            &|a, b| self.exposed_walk_edge(a, b, shape),
+                        );
                     } else if patch.wall {
                         for k in 0..patch.polygon.len() {
                             vertical(
@@ -766,9 +1381,9 @@ fn patch_top(
     mesh: &mut MeshData,
     patch: &Patch,
     polygon: &[Point],
-    ends: [f64; 2],
     material: Material,
     (heights, origin): (&HeightGrid, [f64; 3]),
+    top_height: &impl Fn(Point) -> f64,
 ) -> usize {
     let lift = patch.lift;
     let first = mesh.vertices.len();
@@ -791,11 +1406,20 @@ fn patch_top(
                 } else {
                     0.0
                 };
-                vertex[1] += (walk_lift(patch, ends, point) - lift - bevel) as f32;
+                vertex[1] = (top_height(point) - bevel - origin[1]) as f32;
             }
         }
     }
     if let Some((start, end, end_lift)) = patch.ramp {
+        let end_base = patch.profile.map_or_else(
+            || heights.at(end.0, end.1),
+            |profile| {
+                let along = distance(profile.a, project(end, profile.a, profile.b))
+                    / distance(profile.a, profile.b).max(0.01);
+                profile_height(profile, along, heights)
+            },
+        );
+        let end_change = end_base + end_lift - heights.at(end.0, end.1) - lift;
         for vertex in &mut mesh.vertices[first..] {
             let point = (
                 f64::from(vertex[0]) + origin[0],
@@ -806,7 +1430,7 @@ fn patch_top(
             #[allow(clippy::cast_possible_truncation)]
             // a small offset in GPU geometry
             {
-                vertex[1] += ((end_lift - lift) * along.powi(4)) as f32;
+                vertex[1] += (end_change * along.powi(4)) as f32;
             }
         }
     }
@@ -857,6 +1481,13 @@ fn cells(points: &[Point], size: f64, reach: f64) -> Vec<(i64, i64)> {
         .collect()
 }
 
+fn root(links: &[usize], mut index: usize) -> usize {
+    while links[index] != index {
+        index = links[index];
+    }
+    index
+}
+
 fn distance(a: Point, b: Point) -> f64 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
@@ -892,6 +1523,37 @@ fn signed_area(points: &[Point]) -> f64 {
 fn polygon_area(points: &[Point]) -> f64 {
     signed_area(points).abs()
 }
+
+fn convex_hull(points: &[Point]) -> Vec<Point> {
+    // An inner offset wider than the remaining island folds across itself. Its bounded
+    // hull is the walkable remainder; exact carriageway masks still remove all road area.
+    let mut points = points.to_vec();
+    points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    points.dedup_by(|a, b| distance(*a, *b) < 1e-9);
+    let half = |points: Vec<Point>| {
+        let mut edge: Vec<Point> = Vec::new();
+        for p in points {
+            while edge.len() > 1 {
+                let (a, b) = (edge[edge.len() - 2], edge[edge.len() - 1]);
+                if (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0) > 1e-10 {
+                    break;
+                }
+                edge.pop();
+            }
+            edge.push(p);
+        }
+        edge
+    };
+    let mut lower = half(points.clone());
+    points.reverse();
+    let mut upper = half(points);
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower.reverse();
+    lower
+}
+
 fn contains(points: &[Point], p: Point) -> bool {
     let mut inside = false;
     for (a, b) in points
@@ -955,6 +1617,11 @@ fn split_by_mask(subject: &[Point], mask: &[Point]) -> (Vec<Vec<Point>>, Vec<Poi
         .zip(mask.iter().cycle().skip(1))
         .take(mask.len())
     {
+        // Boolean cuts can repeat a vertex. A zero-length edge must not return the
+        // entire inside remainder as another outside piece.
+        if distance(a, b) < 1e-6 {
+            continue;
+        }
         if inside.is_empty() {
             break;
         }
@@ -1026,6 +1693,25 @@ fn curb_uv(patch: &Patch, point: Point) -> [f32; 2] {
 }
 
 fn surface_normals(mesh: &mut MeshData, first: usize, first_index: usize) {
+    // Clipping can leave slivers narrower than the GPU positions can represent. Their
+    // quantised heights can reverse a face or its slope; they cannot form a visible tread.
+    let kept: Vec<_> = mesh.indices[first_index..]
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter(|face| {
+            let [a, b, c] = face.map(|i| mesh.vertices[i as usize]);
+            let area = (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0]);
+            let longest = [(a, b), (b, c), (c, a)]
+                .into_iter()
+                .map(|(p, q)| (p[0] - q[0]).hypot(p[2] - q[2]))
+                .fold(0.0_f32, f32::max);
+            area > longest * 0.0001
+        })
+        .flat_map(|face| *face)
+        .collect();
+    mesh.indices.truncate(first_index);
+    mesh.indices.extend(kept);
     // Draped normals describe the terrain; entrance ramps and the curb's bevel
     // need the normal of the final raised surface instead.
     mesh.normals[first..].fill([0.0; 3]);
@@ -1065,17 +1751,41 @@ fn surface_normals(mesh: &mut MeshData, first: usize, first_index: usize) {
     }
 }
 
-fn walk_lift(patch: &Patch, ends: [f64; 2], point: Point) -> f64 {
+fn walk_fraction(patch: &Patch, point: Point) -> f64 {
     let from_edge = |a: Point, b: Point| {
         ((b.0 - a.0) * (point.1 - a.1) - (b.1 - a.1) * (point.0 - a.0)).abs()
             / distance(a, b).max(1e-9)
     };
     let start = from_edge(patch.polygon[0], patch.polygon[3]);
     let end = from_edge(patch.polygon[1], patch.polygon[2]);
-    let along = start / (start + end).max(1e-9);
-    ends[0] + (ends[1] - ends[0]) * along
+    start / (start + end).max(1e-9)
 }
 
+fn walk_lift(patch: &Patch, ends: [f64; 2], point: Point) -> f64 {
+    ends[0] + (ends[1] - ends[0]) * walk_fraction(patch, point)
+}
+
+fn walk_base(patch: &Patch, point: Point, heights: &HeightGrid) -> f64 {
+    let profile = patch.profile.unwrap_or(Profile {
+        a: patch.polygon[0],
+        b: patch.polygon[1],
+        elevations: [None; 2],
+        span: [0.0, 1.0],
+    });
+    profile_height(profile, walk_fraction(patch, point), heights)
+}
+
+fn profile_height(profile: Profile, along: f64, heights: &HeightGrid) -> f64 {
+    let [a, b] = [profile.a, profile.b].map(|p| heights.at(p.0, p.1));
+    let [a, b] = [
+        profile.elevations[0].unwrap_or(a),
+        profile.elevations[1].unwrap_or(b),
+    ];
+    let along = profile.span[0] + (profile.span[1] - profile.span[0]) * along;
+    a + (b - a) * along
+}
+
+#[allow(clippy::too_many_arguments)] // the existing top plus its exposed boundary
 fn walk_sides(
     mesh: &mut MeshData,
     first_index: usize,
@@ -1083,6 +1793,7 @@ fn walk_sides(
     patch: &Patch,
     heights: &HeightGrid,
     origin: [f64; 3],
+    exposed: &impl Fn(Point, Point) -> Vec<(Point, Point)>,
 ) {
     let mut sides = Vec::new();
     // Reuse the top's terrain cuts: a long straight side can otherwise bridge a
@@ -1118,19 +1829,75 @@ fn walk_sides(
         }
     }
     for (a, b, top) in sides {
-        let first = mesh.vertices.len();
-        vertical_piece(mesh, a, b, -0.02, top, heights, origin);
-        let curb = [a, b].into_iter().all(|point| {
-            distance(point, project(point, patch.polygon[0], patch.polygon[1])) < 1e-4
-        });
-        if curb {
-            for (i, point) in [a, a, b, b].into_iter().enumerate() {
-                mesh.uvs[first + i][0] = curb_uv(patch, point)[0];
+        let absolute = [top[0] + heights.at(a.0, a.1), top[1] + heights.at(b.0, b.1)];
+        for (start, end) in exposed(a, b) {
+            let lift = |p: Point| {
+                let t = distance(a, p) / distance(a, b);
+                absolute[0] + (absolute[1] - absolute[0]) * t - heights.at(p.0, p.1)
+            };
+            let (a, b, top) = (start, end, [lift(start), lift(end)]);
+            let first = mesh.vertices.len();
+            vertical_piece(mesh, a, b, -0.02, top, heights, origin);
+            let curb = [a, b].into_iter().all(|point| {
+                distance(point, project(point, patch.polygon[0], patch.polygon[1])) < 1e-4
+            });
+            if curb {
+                for (i, point) in [a, a, b, b].into_iter().enumerate() {
+                    mesh.uvs[first + i][0] = curb_uv(patch, point)[0];
+                }
+            } else {
+                mesh.colors[first..].fill(Material::Concrete.color());
             }
-        } else {
-            mesh.colors[first..].fill(Material::Concrete.color());
         }
     }
+}
+
+fn walking_connection(first: &[Point], second: &[Point]) -> bool {
+    [first, second]
+        .into_iter()
+        .zip([second, first])
+        .any(|(a, b)| {
+            a.iter()
+                .copied()
+                .zip(a.iter().copied().cycle().skip(1))
+                .take(a.len())
+                .any(|(start, end)| {
+                    segment_inside(start, end, b)
+                        .is_some_and(|(low, high)| (high - low) * distance(start, end) > 0.02)
+                })
+        })
+}
+
+fn segment_inside(a: Point, b: Point, polygon: &[Point]) -> Option<(f64, f64)> {
+    let sign = signed_area(polygon).signum();
+    let (mut low, mut high) = (0.0_f64, 1.0_f64);
+    for (&p, &q) in polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .take(polygon.len())
+    {
+        if distance(p, q) < 1e-6 {
+            continue;
+        }
+        // Top edges have already been quantised for the GPU, unlike these footprint masks.
+        let side = |v: Point| {
+            sign * ((q.0 - p.0) * (v.1 - p.1) - (q.1 - p.1) * (v.0 - p.0)) + distance(p, q) * 0.0001
+        };
+        let (fa, fb) = (side(a), side(b));
+        if fa < 0.0 && fb < 0.0 {
+            return None;
+        }
+        if fa < 0.0 {
+            low = low.max(fa / (fa - fb));
+        }
+        if fb < 0.0 {
+            high = high.min(fa / (fa - fb));
+        }
+        if high <= low {
+            return None;
+        }
+    }
+    Some((low, high))
 }
 
 fn overlaps(first: &[Point], second: &[Point]) -> bool {
@@ -1153,6 +1920,22 @@ fn overlaps(first: &[Point], second: &[Point]) -> bool {
             })
         })
 }
+fn way_ribbon(way: Way, margin: f64) -> Vec<Point> {
+    let d = direction(way.a, way.b);
+    let edge = |point: Point, half: f64, side: f64| {
+        (
+            point.0 + d.1 * (half + margin) * side,
+            point.1 - d.0 * (half + margin) * side,
+        )
+    };
+    vec![
+        edge(way.a, way.half, 1.0),
+        edge(way.b, way.end_half, 1.0),
+        edge(way.b, way.end_half, -1.0),
+        edge(way.a, way.half, -1.0),
+    ]
+}
+
 fn ribbon(a: Point, b: Point, half: f64) -> Vec<Point> {
     let d = direction(a, b);
     let offset = (d.1 * half, -d.0 * half);
@@ -1205,11 +1988,13 @@ fn vertical_piece(
     let d = direction(a, b);
     let n = [-d.1 as f32, 0.0, -d.0 as f32];
     let base = u32::try_from(mesh.vertices.len()).expect("urban mesh fits u32");
+    // A street profile can meet the bank partway through an edge. Keep the buried bottom
+    // below that profile too, rather than turning the side inside out under the ground.
     for (point, lift, u) in [
-        (a, low, 0.0),
+        (a, low.min(high[0] - 0.02), 0.0),
         (a, high[0], 0.0),
         (b, high[1], distance(a, b)),
-        (b, low, distance(a, b)),
+        (b, low.min(high[1] - 0.02), distance(a, b)),
     ] {
         mesh.vertices.push([
             (point.0 - origin[0]) as f32,
@@ -1223,4 +2008,150 @@ fn vertical_piece(
     // Godot's clockwise front faces point against the right-hand cross product.
     mesh.indices
         .extend([base, base + 2, base + 1, base, base + 3, base + 2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(urban: &mut Urban, polygon: Vec<Point>, curb: bool) {
+        urban.add_patch(Patch {
+            polygon,
+            material: Material::Concrete,
+            lift: CURB_HEIGHT,
+            curb,
+            wall: false,
+            ramp: None,
+            profile: None,
+        });
+        urban
+            .shapes
+            .push(vec![urban.patches.last().unwrap().polygon.clone()]);
+    }
+
+    #[test]
+    fn minimum_length_applies_to_connected_runs_not_individual_slabs_or_chunks() {
+        for shift in [0.0, CHUNK_SIZE - 6.0] {
+            let mut urban = Urban::default();
+            for i in 0..4 {
+                let start = shift + f64::from(i) * 3.0;
+                walk(
+                    &mut urban,
+                    ribbon((0.0, start), (0.0, start + 3.0), WALK_WIDTH / 2.0),
+                    true,
+                );
+            }
+            // A nearly twelve metre run, a corner-touching pair and a nearby separate run
+            // must not borrow length from the valid sidewalk.
+            walk(
+                &mut urban,
+                ribbon((10.0, shift), (10.0, shift + 11.99), WALK_WIDTH / 2.0),
+                true,
+            );
+            walk(
+                &mut urban,
+                ribbon((20.0, shift), (20.0, shift + 7.0), WALK_WIDTH / 2.0),
+                true,
+            );
+            walk(
+                &mut urban,
+                ribbon(
+                    (20.0 + WALK_WIDTH, shift + 7.0),
+                    (20.0 + WALK_WIDTH, shift + 14.0),
+                    WALK_WIDTH / 2.0,
+                ),
+                true,
+            );
+            // Building accesses and forecourts have their own eligibility rules.
+            walk(
+                &mut urban,
+                ribbon((30.0, shift), (30.0, shift + 2.0), 0.6),
+                false,
+            );
+            urban.retain_walk_runs();
+            assert!(urban.shapes[..4].iter().all(|s| !s.is_empty()));
+            assert!(urban.shapes[4..7].iter().all(Vec::is_empty));
+            assert_eq!(urban.shapes[7].len(), 1, "building access must remain");
+        }
+    }
+
+    #[test]
+    fn clipping_cannot_qualify_a_short_remnant_with_its_missing_source_length() {
+        let mut urban = Urban::default();
+        walk(
+            &mut urban,
+            ribbon((0.0, 0.0), (0.0, 100.0), WALK_WIDTH / 2.0),
+            true,
+        );
+        urban.shapes[0] = vec![
+            ribbon((0.0, 0.0), (0.0, 4.0), WALK_WIDTH / 2.0),
+            ribbon((0.0, 20.0), (0.0, 40.0), WALK_WIDTH / 2.0),
+        ];
+        urban.retain_walk_runs();
+        assert_eq!(urban.shapes[0].len(), 1);
+        assert!(urban.shapes[0][0].iter().all(|p| p.1 >= 20.0));
+    }
+
+    #[test]
+    fn transverse_clipping_partitions_do_not_multiply_walking_length() {
+        let mut urban = Urban::default();
+        walk(
+            &mut urban,
+            ribbon((0.0, 0.0), (0.0, 8.0), WALK_WIDTH / 2.0),
+            true,
+        );
+        urban.shapes[0] = vec![
+            ribbon(
+                (-WALK_WIDTH / 4.0, 0.0),
+                (-WALK_WIDTH / 4.0, 8.0),
+                WALK_WIDTH / 4.0,
+            ),
+            ribbon(
+                (WALK_WIDTH / 4.0, 0.0),
+                (WALK_WIDTH / 4.0, 8.0),
+                WALK_WIDTH / 4.0,
+            ),
+        ];
+        urban.retain_walk_runs();
+        assert_eq!(urban.shapes[0].len(), 0, "short partitioned run survived");
+    }
+
+    #[test]
+    fn curved_runs_are_measured_along_the_walk_not_across_the_bend() {
+        for (angle, keep) in [(1.1, false), (1.3, true)] {
+            let mut urban = Urban::default();
+            for i in 0..20 {
+                let (a, b) = (f64::from(i) * angle / 20.0, f64::from(i + 1) * angle / 20.0);
+                let p = |a: f64, r: f64| (r * a.cos(), r * a.sin());
+                walk(
+                    &mut urban,
+                    vec![p(a, 9.1), p(b, 9.1), p(b, 10.9), p(a, 10.9)],
+                    true,
+                );
+            }
+            urban.retain_walk_runs();
+            assert!(urban.shapes.iter().all(|s| s.is_empty() != keep));
+        }
+    }
+
+    #[test]
+    fn repeated_cut_vertices_do_not_duplicate_or_hide_paving() {
+        let subject = [(0.0, 0.0), (0.0, 4.0), (4.0, 4.0), (4.0, 0.0)];
+        let mask = [
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (3.0, 3.0),
+            (3.0, 3.0),
+            (3.0 + 1e-14, 3.0),
+            (3.0, 1.0),
+        ];
+        let (outside, inside) = split_by_mask(&subject, &mask);
+        assert!((outside.iter().map(|p| polygon_area(p)).sum::<f64>() - 12.0).abs() < 1e-8);
+        assert!((polygon_area(&inside) - 4.0).abs() < 1e-8);
+        let (a, b) = segment_inside((0.0, 2.0), (4.0, 2.0), &mask).unwrap();
+        assert!(
+            (a - 0.25).abs() < 0.0001 && (b - 0.75).abs() < 0.0001,
+            "repeated vertices must not invent a clipping plane"
+        );
+    }
 }

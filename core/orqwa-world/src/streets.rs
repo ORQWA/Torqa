@@ -62,6 +62,10 @@ pub(crate) struct Street {
 }
 
 impl Street {
+    pub(crate) fn sources(&self) -> &[usize] {
+        &self.sources
+    }
+
     /// Its points, a few metres apart.
     pub(crate) fn points(&self) -> &[(f64, f64)] {
         &self.points
