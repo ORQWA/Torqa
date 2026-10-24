@@ -436,8 +436,17 @@ msgstr "Alle Geräte suchen"
 msgid "The devices used last connect by themselves. Search beside a row to find one of that kind."
 msgstr "Zuletzt genutzte Geräte verbinden sich von selbst. Suche neben einer Zeile nach einem Gerät dieser Art."
 
-msgid "The kept worlds take %s."
-msgstr "Die behaltenen Welten belegen %s."
+msgid "Kept worlds"
+msgstr "Behaltene Welten"
+
+msgid "None yet."
+msgstr "Noch keine."
+
+msgid "Delete world"
+msgstr "Welt löschen"
+
+msgid "Total"
+msgstr "Total"
 
 msgid "Reconnecting…"
 msgstr "Verbinde erneut…"

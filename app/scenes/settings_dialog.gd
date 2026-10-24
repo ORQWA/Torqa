@@ -2,8 +2,8 @@ class_name SettingsDialog
 extends AcceptDialog
 ## The settings, opened from the cog at the top right of the start page (R83): this
 ## computer's graphics and full screen (R43, R78, #218), applied as they change, its courses'
-## kept worlds (R101), the app's own sounds (R125), and About: the version, the commit, looking
-## for updates (R99) and the licences.
+## kept worlds (R101), each to delete (R136), the app's own sounds (R125), and About: the
+## version, the commit, looking for updates (R99) and the licences.
 
 var _tabs: TabContainer = TabContainer.new()
 var _graphics: GraphicsSettings = GraphicsSettings.new()
@@ -21,8 +21,10 @@ func _ready() -> void:
 	var graphics_page: ScrollContainer = UiTheme.scrolling(_graphics)
 	graphics_page.name = tr("Graphics")
 	_tabs.add_child(graphics_page)
-	_courses.name = tr("Courses")
-	_tabs.add_child(_courses)
+	# Its kept worlds (R136) may be more than a window shows.
+	var courses_page: ScrollContainer = UiTheme.scrolling(_courses)
+	courses_page.name = tr("Courses")
+	_tabs.add_child(courses_page)
 	_sound.name = tr("Sound")
 	_tabs.add_child(_sound)
 	_about.name = tr("About")

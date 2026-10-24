@@ -381,6 +381,21 @@ static func duration(seconds: float) -> String:
 	return "%d:%02d" % [total / 60, total % 60]
 
 
+## A size on disk in the units riders know from their drives, e.g. "238 MB" or "1.3 GB":
+## powers of 1000, not the 1024 of MiB and GiB.
+static func bytes(size: int) -> String:
+	var units: Array[String] = ["B", "kB", "MB", "GB", "TB"]
+	var value: float = size
+	var unit: int = 0
+	# From 999.5 on, the value would round to 1000 of its unit: one of the next instead.
+	while value >= 999.5 and unit < units.size() - 1:
+		value /= 1000.0
+		unit += 1
+	if unit > 0 and value < 9.95:
+		return "%.1f %s" % [value, units[unit]]
+	return "%d %s" % [roundi(value), units[unit]]
+
+
 ## Local date and time of a Unix timestamp, e.g. "Sat 3 Oct 2026, 07:15"; the date alone is
 ## the part before the comma.
 static func date(unix_s: int) -> String:

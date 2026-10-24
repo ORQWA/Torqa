@@ -22,6 +22,7 @@ pub mod video;
 pub mod view;
 
 pub use import::{Imported, LoadStage, Progress, countries, course_map, import_gpx, import_route};
+pub use kept::KeptWorld;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

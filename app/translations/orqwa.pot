@@ -871,6 +871,10 @@ msgstr ""
 msgid "Delete workout?"
 msgstr ""
 
+#: app/ui/course_settings.gd
+msgid "Delete world"
+msgstr ""
+
 #: app/scenes/courses_tab.gd
 msgid "Descending"
 msgstr ""
@@ -1419,6 +1423,10 @@ msgstr ""
 msgid "Keep this screen on while you ride: turn off its auto-lock."
 msgstr ""
 
+#: app/ui/course_settings.gd
+msgid "Kept worlds"
+msgstr ""
+
 #: app/scenes/profile_tab.gd app/ui/profile_form.gd
 msgid "Language"
 msgstr ""
@@ -1709,6 +1717,10 @@ msgstr ""
 
 #: app/scenes/devices_tab.gd
 msgid "None (the trainer measures)"
+msgstr ""
+
+#: app/ui/course_settings.gd
+msgid "None yet."
 msgstr ""
 
 #: app/scenes/course_edit_dialog.gd
@@ -2499,10 +2511,6 @@ msgstr ""
 msgid "The devices used last connect by themselves. Search beside a row to find one of that kind."
 msgstr ""
 
-#: app/ui/course_settings.gd
-msgid "The kept worlds take %s."
-msgstr ""
-
 #: app/scenes/profile_tab.gd core/orqwa-app/src/failure.rs
 msgid "The only rider cannot be deleted"
 msgstr ""
@@ -2621,6 +2629,10 @@ msgstr ""
 
 #: core/orqwa-app/src/hud.rs
 msgid "To go"
+msgstr ""
+
+#: app/ui/course_settings.gd
+msgid "Total"
 msgstr ""
 
 #: app/scenes/devices_tab.gd app/ui/ride_devices.gd

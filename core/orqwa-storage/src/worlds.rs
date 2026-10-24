@@ -52,7 +52,9 @@ impl KeptWorlds {
         }
     }
 
-    fn file(&self, fingerprint: &str) -> PathBuf {
+    /// Where the world of the course with `fingerprint` is kept, or would be.
+    #[must_use]
+    pub fn file(&self, fingerprint: &str) -> PathBuf {
         self.root.join(format!("{fingerprint}.{EXTENSION}"))
     }
 
@@ -60,6 +62,16 @@ impl KeptWorlds {
     #[must_use]
     pub fn has(&self, fingerprint: &str) -> bool {
         self.file(fingerprint).is_file()
+    }
+
+    /// How many bytes the kept world of the course with `fingerprint` takes on disk; `None` if
+    /// none is kept.
+    #[must_use]
+    pub fn size_of(&self, fingerprint: &str) -> Option<u64> {
+        std::fs::metadata(self.file(fingerprint))
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
     }
 
     /// The version of the [generator](orqwa_world::GENERATOR) that built the kept world of the
@@ -312,6 +324,7 @@ mod tests {
         assert!(!kept.has("f1"));
         assert_eq!(kept.read("f1").unwrap(), None);
         assert_eq!(kept.generator("f1"), None);
+        assert_eq!(kept.size_of("f1"), None);
         // More chunks than cores, so that every worker reads several.
         let built = world(100);
         kept.write("f1", &built, 3).unwrap();
@@ -328,7 +341,10 @@ mod tests {
         assert_eq!(kept.read("f1").unwrap(), Some((world(2), 4)));
         assert_eq!(kept.generator("f1"), Some(4));
         assert_eq!(kept.read("f2").unwrap(), Some((world(0), 3)));
-        assert!(kept.size() > 0);
+        // Each world's own room, for the settings to list (R136), adds up to the total.
+        let (f1, f2) = (kept.size_of("f1").unwrap(), kept.size_of("f2").unwrap());
+        assert!(f1 > f2, "the world with more chunks takes more");
+        assert_eq!(kept.size(), f1 + f2);
         std::fs::remove_dir_all(cache).unwrap();
     }
 

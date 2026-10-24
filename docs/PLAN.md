@@ -179,6 +179,8 @@ Built in rideable steps:
 - [x] **Keep courses ready to ride**: an opt-in setting keeps a course's built world in the
   cache, so riding it again starts at once; kept worlds stay across updates, and a course
   offers to regenerate one an older generator built (R101, ADR 0025, #237)
+- [x] The settings' Courses tab lists each kept world with the room it takes and a bin to
+  delete it alone; the course stays and its next ride builds the world again (R136, #355)
 - **Exit:** prepare a course online, ride it offline on another machine from the `.tqc` file ✅
   (2026-10-03, Lake Biel 7 km: 6.2 MB, opened offline with an empty cache)
 

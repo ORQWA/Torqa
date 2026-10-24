@@ -1759,6 +1759,41 @@ impl OrqwaApp {
         })
     }
 
+    /// The worlds this computer keeps (R136), by course name: `[{path, names, size}]`, `path`
+    /// one of the world's courses, to delete it by with `delete_kept_world`, `names` those of
+    /// the courses it is the world of (one, unless a course is in the library twice) and
+    /// `size` the bytes it takes. Empty while worlds are not kept.
+    #[func]
+    fn kept_worlds(&self) -> VarArray {
+        let mut array = VarArray::new();
+        for world in self.app.as_ref().map(App::kept_worlds).unwrap_or_default() {
+            let Some(first) = world.courses.first() else {
+                continue;
+            };
+            let names: PackedStringArray = world
+                .courses
+                .iter()
+                .map(|course| GString::from(course.manifest.name.as_str()))
+                .collect();
+            let dict = vdict! {
+                "path" => first.path.display().to_string().as_str(),
+                "names" => &names,
+                "size" => i64::try_from(world.size).unwrap_or(i64::MAX),
+            };
+            array.push(&dict.to_variant());
+        }
+        array
+    }
+
+    /// Deletes the kept world of the course at `path` (R136): the course stays, and its next
+    /// ride builds the world again. Emits `failed` on errors.
+    #[func]
+    #[allow(clippy::needless_pass_by_value)] // #[func] parameters are passed by value from Godot
+    fn delete_kept_world(&mut self, path: GString) -> bool {
+        let path = PathBuf::from(path.to_string());
+        self.command(|app| app.delete_kept_world(&path))
+    }
+
     /// Looks for a newer ORQWA in the background (R99): at start-up (`asked` false) only if
     /// this computer does, telling only a newer version; when the rider `asked`, also
     /// `up_to_date` or `update_failed`. Never during a ride. Whether it looks.

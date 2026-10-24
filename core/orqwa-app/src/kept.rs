@@ -15,7 +15,17 @@ use orqwa_world::{GENERATOR, World};
 use tracing::{info, warn};
 
 use crate::failure::{Failure, Kind};
-use crate::{App, AppError};
+use crate::{App, AppError, CourseEntry};
+
+/// A world this computer keeps, as the settings list it to delete (R136).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptWorld {
+    /// The library's courses it is the world of, by name: one, unless the same course is in
+    /// the library twice.
+    pub courses: Vec<CourseEntry>,
+    /// How many bytes it takes on disk.
+    pub size: u64,
+}
 
 /// What the cache holds of a course's world.
 pub(crate) enum Found {
@@ -149,6 +159,45 @@ impl App {
         self.keeper().kept.size()
     }
 
+    /// The worlds this computer keeps of the library's courses, by the name of their first
+    /// course (R136); none while it keeps none, as turning it off deletes them all.
+    #[must_use]
+    pub fn kept_worlds(&self) -> Vec<KeptWorld> {
+        if !self.keeps_worlds() {
+            return Vec::new();
+        }
+        let kept = self.keeper().kept;
+        let mut worlds: Vec<(String, KeptWorld)> = Vec::new();
+        for entry in self.courses() {
+            let Ok(fingerprint) = course::fingerprint(&entry.path) else {
+                continue;
+            };
+            if let Some((_, world)) = worlds.iter_mut().find(|(f, _)| *f == fingerprint) {
+                world.courses.push(entry);
+            } else if let Some(size) = kept.size_of(&fingerprint) {
+                let courses = vec![entry];
+                worlds.push((fingerprint, KeptWorld { courses, size }));
+            }
+        }
+        worlds.into_iter().map(|(_, world)| world).collect()
+    }
+
+    /// Deletes the kept world of the course at `course` (R136), and so of every course it is
+    /// the world of: the course stays, and its next ride builds and keeps it again.
+    ///
+    /// # Errors
+    /// [`AppError::Reported`] if the world cannot be deleted.
+    pub fn delete_kept_world(&self, course: &Path) -> Result<(), AppError> {
+        let fingerprint = course::fingerprint(course).map_err(|e| {
+            AppError::Reported(Failure::new(Kind::OpenFile, e).arg(course.display()))
+        })?;
+        let kept = self.keeper().kept;
+        kept.remove(&fingerprint).map_err(|e| {
+            let file = kept.file(&fingerprint);
+            AppError::Reported(Failure::new(Kind::DeleteFile, e).arg(file.display()))
+        })
+    }
+
     /// Whether the course at `course` has a world kept that an older generator built, which
     /// [`App::regenerate_world`] builds again. Courses with a video are ridden along it and
     /// never asked.
@@ -232,7 +281,12 @@ mod tests {
 
     /// Prepares the test route as a course of `app`'s library.
     fn prepare(app: &mut App, dir: &Path) -> PathBuf {
-        app.load_route(write_route(dir), true);
+        prepare_gpx(app, write_route(dir))
+    }
+
+    /// Prepares the route of the GPX file at `gpx` as a course of `app`'s library.
+    fn prepare_gpx(app: &mut App, gpx: PathBuf) -> PathBuf {
+        app.load_route(gpx, true);
         let events = run_until(app, |e| matches!(e, AppEvent::CourseAdded(_)));
         let Some(AppEvent::CourseAdded(course)) = events.last() else {
             unreachable!()
@@ -365,6 +419,77 @@ mod tests {
             MARK,
             "and kept in place of the older"
         );
+        app.shutdown();
+    }
+
+    #[test]
+    fn the_settings_list_each_kept_world_with_its_room_to_delete_it() {
+        let dir = temp_dir("kept-list");
+        let mut app = App::new(dir.join("data"), dir.join("cache")).unwrap();
+        app.set_keeps_worlds(true).unwrap();
+        assert_eq!(app.kept_worlds(), Vec::new(), "none kept yet");
+        let lakeside = prepare(&mut app, &dir);
+        app.rename_course(&lakeside, "Lakeside").unwrap();
+        // Another route, a kilometre east.
+        let east = std::fs::read_to_string(write_route(&dir))
+            .unwrap()
+            .replace(r#"lon="7""#, r#"lon="7.013""#);
+        let gpx = dir.join("east.gpx");
+        std::fs::write(&gpx, east).unwrap();
+        let hills = prepare_gpx(&mut app, gpx);
+        app.rename_course(&hills, "Hills").unwrap();
+        // The same course twice in the library has one world.
+        let again = lakeside.with_file_name("again.tqc");
+        std::fs::copy(&lakeside, &again).unwrap();
+        app.rename_course(&again, "Lakeside again").unwrap();
+        let keeper = app.keeper();
+        let [lakeside_world, hills_world] =
+            [&lakeside, &hills].map(|c| course::fingerprint(c).unwrap());
+        assert_ne!(lakeside_world, hills_world);
+        wait_for(&mut app, |_| {
+            keeper.kept.has(&lakeside_world) && keeper.kept.has(&hills_world)
+        });
+
+        let names = |app: &App| -> Vec<Vec<String>> {
+            app.kept_worlds()
+                .iter()
+                .map(|world| {
+                    let courses = world.courses.iter();
+                    courses.map(|c| c.manifest.name.clone()).collect()
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&app),
+            [vec!["Hills"], vec!["Lakeside", "Lakeside again"]],
+            "by name, a world shared by two courses once"
+        );
+        let worlds = app.kept_worlds();
+        assert_eq!(Some(worlds[0].size), keeper.kept.size_of(&hills_world));
+        assert_eq!(Some(worlds[1].size), keeper.kept.size_of(&lakeside_world));
+        assert_eq!(
+            worlds.iter().map(|world| world.size).sum::<u64>(),
+            app.kept_worlds_size(),
+            "all the room the kept worlds take is listed"
+        );
+
+        app.delete_kept_world(&again).unwrap();
+        assert!(
+            !keeper.kept.has(&lakeside_world),
+            "deleted for both its courses"
+        );
+        assert_eq!(names(&app), [vec!["Hills"]], "the other world stays");
+        assert!(lakeside.exists() && again.exists(), "and the courses do");
+        app.delete_kept_world(&again)
+            .expect("a list shown before it went may delete it again");
+        // Its next ride builds and keeps it again.
+        ride(&mut app, &lakeside);
+        wait_for(&mut app, |_| keeper.kept.has(&lakeside_world));
+        assert_eq!(names(&app).len(), 2);
+
+        // Turned off, they are all being deleted.
+        app.set_keeps_worlds(false).unwrap();
+        assert_eq!(app.kept_worlds(), Vec::new());
         app.shutdown();
     }
 
